@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.filters import Command
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -32,6 +32,19 @@ def get_channel_keyboard() -> InlineKeyboardMarkup:
             )
         ]
     ])
+
+# Заглушка HTTP-сервера для успішної перевірки портів на Render (Health Check)
+async def handle_health_check(reader, writer):
+    response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
+    writer.write(response.encode('utf-8'))
+    await writer.drain()
+    writer.close()
+
+async def start_health_check_server():
+    port = int(os.getenv("PORT", 8080))
+    server = await asyncio.start_server(handle_health_check, "0.0.0.0", port)
+    logging.info(f"Health check server listening on port {port}")
+    return server
 
 @router.message(Command("start"))
 async def cmd_start(message: Message):
@@ -69,7 +82,7 @@ async def handle_admin_screenshot(message: Message):
     )
 
 @router.callback_query(F.data == "confirm_pub")
-async def confirm_publishing(callback: aiogram.types.CallbackQuery):
+async def confirm_publishing(callback: CallbackQuery):
     user_id = callback.from_user.id
     if user_id not in admin_storage:
         await callback.answer("Data expired, please send the photo again.", show_alert=True)
@@ -93,7 +106,7 @@ async def confirm_publishing(callback: aiogram.types.CallbackQuery):
     await callback.answer()
 
 @router.callback_query(F.data == "cancel_pub")
-async def cancel_publishing(callback: aiogram.types.CallbackQuery):
+async def cancel_publishing(callback: CallbackQuery):
     user_id = callback.from_user.id
     if user_id in admin_storage:
         del admin_storage[user_id]
@@ -120,6 +133,9 @@ async def send_scheduled_report():
 async def main():
     dp = Dispatcher()
     dp.include_router(router)
+    
+    # Запускаємо сервер перевірки порту для Render
+    await start_health_check_server()
     
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(send_scheduled_report, 'cron', hour=10, minute=0)
