@@ -49,7 +49,7 @@ async def start_health_check_server():
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     welcome_text = (
-        "👋 Welcome to **Kerdos News** — the official public channel of our community!\n\n"
+        "👋 Welcome to **Corvin** — the official public channel of our community!\n\n"
         "Here we publish reports, analytics, and results of our closed algorithms.\n\n"
         "Want to join the VIP group and set up automated signals?"
     )
