@@ -17,14 +17,17 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")  # ID VIP-групи або каналу
 ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))  # ID адміна
 
+# 🔗 Посилання на загальну групу спілкування
 PUBLIC_CHAT_LINK = os.getenv("PUBLIC_CHAT_LINK", "https://t.me/kerdos_group")
 
 DB_PATH = "trades.db"
 
+# ⬇️ РЕКВІЗИТИ КРИПТОГАМАНЦІВ BINANCE ⬇️
 WALLET_USDT_TRC20 = "THeVYP6zqgJ3jKMhNAuBxqGk47iFno6pKL"
 WALLET_USDT_BEP20 = "0x97eb6c4c2fe24798ccf24ed5d52cb228f32f5f5f"
 WALLET_USDT_SOLANA = "5Pcc4WUfA1qBas6P42WDYRre8ugAenNe5UsN6c2DyUox"
 
+# 🪙 Список монет, доступних для підключення до Signal Bot
 AVAILABLE_COINS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "HYPEUSDT", "LINKUSDT",
     "ONDOUSDT", "JTOUSDT", "LTCUSDT", "APTUSDT", "DOTUSDT",
@@ -34,18 +37,36 @@ AVAILABLE_COINS = [
 ]
 
 bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
+
+# Кешований username бота. Заповнюється один раз у lifespan (див. нижче),
+# щоб НЕ робити зайвий виклик bot.get_me() на кожен клік по кнопці "Реферальна програма".
 BOT_USERNAME = None
 
 
+# =======================================================
+# БЛОК ДОДАНОГО ФУНКЦІОНАЛУ: ЕКРАНУВАННЯ MARKDOWN
+# =======================================================
 def escape_md(text) -> str:
+    """
+    Екранує спецсимволи застарілого Telegram Markdown (V1): _ * ` [
+    Без цього, якщо юзернейм, повідомлення в підтримку, текст квитанції або
+    Signal Token містить один з цих символів (напр. @my_name), Telegram
+    поверне помилку "can't parse entities" і повідомлення не надійде.
+    Застосовується до БУДЬ-ЯКОГО динамічного/введеного користувачем тексту,
+    який підставляється у повідомлення з parse_mode="Markdown".
+    """
     if text is None:
         return ""
     text = str(text)
     for ch in ("_", "*", "`", "["):
         text = text.replace(ch, f"\\{ch}")
     return text
+# =======================================================
 
 
+# =======================================================
+# БЛОК ДОДАНОГО ФУНКЦІОНАЛУ: LIFESPAN ЗАМІСТЬ on_event
+# =======================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global BOT_USERNAME
@@ -70,12 +91,22 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-
+# =======================================================
 
 # --- БАЗА ДАНИХ ---
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT,
+                action TEXT,
+                price REAL,
+                roi REAL,
+                timestamp DATETIME
+            )
+        """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -93,12 +124,77 @@ async def init_db():
                 selected_coin TEXT
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS coin_roi (
+                ticker TEXT PRIMARY KEY,
+                roi REAL,
+                updated_at DATETIME
+            )
+        """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS active_trades (
+            symbol TEXT PRIMARY KEY,
+            entry_price REAL,
+            direction TEXT,
+            time TEXT
+        )
+    """)
+        # Міграція: додаємо selected_coin, якщо БД була створена до цього оновлення
         try:
             await db.execute("ALTER TABLE users ADD COLUMN selected_coin TEXT")
         except Exception:
-            pass
+            pass  # колонка вже існує
         await db.commit()
 
+
+async def get_coin_roi(ticker: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT roi, updated_at FROM coin_roi WHERE ticker = ?", (ticker,)) as cursor:
+            row = await cursor.fetchone()
+            if row and row[0] is not None:
+                return row[0]
+    return None
+
+async def save_active_trade(symbol: str, entry_price: float, direction: str, time_str: str):
+    """Зберігає або оновлює інформацію про відкриту позицію монети."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+            INSERT OR REPLACE INTO active_trades (symbol, entry_price, direction, time)
+            VALUES (?, ?, ?, ?)
+        ''', (symbol, entry_price, direction, time_str))
+        await db.commit()
+
+async def get_active_trade(symbol: str):
+    """Отримує відкриту позицію для конкретної монети."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT entry_price, direction, time FROM active_trades WHERE symbol = ?', (symbol,)) as cursor:
+            row = await cursor.fetchone()
+            return row
+
+async def delete_active_trade(symbol: str):
+    """Видаляє позицію з активних після її закриття."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('DELETE FROM active_trades WHERE symbol = ?', (symbol,))
+        await db.commit()
+
+async def get_all_coin_roi() -> dict:
+    result = {}
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT ticker, roi FROM coin_roi") as cursor:
+            rows = await cursor.fetchall()
+            for ticker, roi in rows:
+                result[ticker] = roi
+    return result
+
+async def set_coin_roi(ticker: str, roi: float):
+    now = datetime.now(timezone.utc)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO coin_roi (ticker, roi, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(ticker) DO UPDATE SET roi = excluded.roi, updated_at = excluded.updated_at
+        """, (ticker, roi, now.isoformat()))
+        await db.commit()
 
 async def set_user_selected_coin(user_id: int, ticker: str):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -109,7 +205,6 @@ async def set_user_selected_coin(user_id: int, ticker: str):
         """, (user_id, ticker))
         await db.commit()
 
-
 async def get_user_lang(user_id: int) -> str:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT lang FROM users WHERE user_id = ?", (user_id,)) as cursor:
@@ -117,7 +212,6 @@ async def get_user_lang(user_id: int) -> str:
             if row and row[0]:
                 return row[0]
     return "ua"
-
 
 async def set_user_lang(user_id: int, lang: str):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -128,7 +222,6 @@ async def set_user_lang(user_id: int, lang: str):
         """, (user_id, lang))
         await db.commit()
 
-
 async def set_awaiting_support(user_id: int, state: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -138,7 +231,6 @@ async def set_awaiting_support(user_id: int, state: int):
         """, (user_id, state))
         await db.commit()
 
-
 async def get_awaiting_support(user_id: int) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT awaiting_support FROM users WHERE user_id = ?", (user_id,)) as cursor:
@@ -147,8 +239,7 @@ async def get_awaiting_support(user_id: int) -> int:
                 return row[0]
     return 0
 
-
-# --- ФОНОВИЙ ТАЙМЕР ---
+# --- ФОНОВИЙ ТАЙМЕР ЗВІЛЬНЕННЯ ТРИАЛУ ТА ПІДПИСКИ ---
 
 async def check_expired_trials():
     while True:
@@ -157,6 +248,7 @@ async def check_expired_trials():
             now = datetime.now(timezone.utc)
 
             async with aiosqlite.connect(DB_PATH) as db:
+                # 1. Завершення триалу (14 днів)
                 async with db.execute(
                     "SELECT user_id, username, lang FROM users WHERE status = 'trial' AND trial_end <= ?",
                     (now.isoformat(),)
@@ -192,6 +284,7 @@ async def check_expired_trials():
                     except Exception as e:
                         logger.error(f"Failed to remove expired user {user_id}: {e}")
 
+                # 2. Завершення платній підписки на VIP-групу
                 async with db.execute(
                     "SELECT user_id, username, lang FROM users WHERE status = 'active' AND sub_end <= ?",
                     (now.isoformat(),)
@@ -223,6 +316,13 @@ async def check_expired_trials():
                     except Exception as e:
                         logger.error(f"Failed to remove expired sub user {user_id}: {e}")
 
+                # =======================================================
+                # БЛОК ДОДАНОГО ФУНКЦІОНАЛУ: ЗАВЕРШЕННЯ ДОСТУПУ ДО SIGNAL BOT
+                # =======================================================
+                # 3. Завершення платної підписки на Signal Bot ($100/30 днів).
+                # OKX-токен більше не пересилається автоматично — тому це
+                # сповіщення також є для адміна нагадуванням прибрати токен
+                # користувача зі сповіщень (Alert Message) TradingView.
                 async with db.execute(
                     "SELECT user_id, username, lang, selected_coin, signal_token FROM users WHERE bot_sub_end IS NOT NULL AND bot_sub_end <= ?",
                     (now.isoformat(),)
@@ -261,15 +361,16 @@ async def check_expired_trials():
                                 f"🆔 **ID:** `{user_id}`\n"
                                 f"🪙 **Монета:** `{coin_disp}`\n"
                                 f"🔑 **Token:** {token_disp}\n\n"
-                                "➡️ Видаліть токен цього користувача зі сповіщення TradingView."
+                                "➡️ Не забудьте видалити токен цього користувача зі сповіщення "
+                                "(Alert Message) у TradingView, якщо він не продовжить підписку."
                             )
                             await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=admin_text, parse_mode="Markdown")
                     except Exception as e:
                         logger.error(f"Failed to process expired bot access for user {user_id}: {e}")
+                # =======================================================
 
         except Exception as e:
             logger.error(f"Error in check_expired_trials loop: {e}")
-
 
 # --- КНОПКИ ТА МЕНЮ ---
 
@@ -302,23 +403,29 @@ def get_main_keyboard(lang="ua"):
         ]
     return InlineKeyboardMarkup(keyboard)
 
-
 def get_back_keyboard(lang="ua"):
     back_text = "🔙 Повернутися в меню" if lang == "ua" else "🔙 Back to Menu"
     return InlineKeyboardMarkup([[InlineKeyboardButton(back_text, callback_data="btn_back_main")]])
-
 
 def get_cancel_support_keyboard(lang="ua"):
     cancel_text = "❌ Скасувати звернення" if lang == "ua" else "❌ Cancel Support Request"
     return InlineKeyboardMarkup([[InlineKeyboardButton(cancel_text, callback_data="btn_cancel_support")]])
 
-
-def get_coin_selection_keyboard():
+async def get_coin_selection_keyboard(lang="ua"):
+    """Клавіатура вибору монети для Signal Bot, з ROI за минулий місяць біля кожної монети."""
+    roi_map = await get_all_coin_roi()
     rows = []
     row = []
-    for ticker in AVAILABLE_COINS:
+    for i, ticker in enumerate(AVAILABLE_COINS):
+        roi = roi_map.get(ticker)
+        if roi is None:
+            roi_label = "н/д" if lang == "ua" else "N/A"
+        else:
+            sign = "+" if roi >= 0 else ""
+            roi_label = f"{sign}{roi:.1f}%"
         display = ticker.replace("USDT", "")
-        row.append(InlineKeyboardButton(display, callback_data=f"coin_{ticker}"))
+        button_text = f"{display} ({roi_label})"
+        row.append(InlineKeyboardButton(button_text, callback_data=f"coin_{ticker}"))
         if len(row) == 2:
             rows.append(row)
             row = []
@@ -326,16 +433,23 @@ def get_coin_selection_keyboard():
         rows.append(row)
     return InlineKeyboardMarkup(rows)
 
-
+# =======================================================
+# БЛОК ДОДАНОГО ФУНКЦІОНАЛУ: КЛАВІАТУРА АДМІН-ПАНЕЛІ
+# =======================================================
 def get_admin_panel_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👥 Список підключених людей", callback_data="admin_users_list")],
         [InlineKeyboardButton("👑 Надати VIP", callback_data="admin_grant_vip")],
-        [InlineKeyboardButton("🤖 Надати доступ до бота", callback_data="admin_grant_bot")]
+        [InlineKeyboardButton("🤖 Надати доступ до бота", callback_data="admin_grant_bot")],
+        [InlineKeyboardButton("📈 Оновити ROI монет", callback_data="admin_roi_info")]
     ])
+# =======================================================
 
-
+# =======================================================
+# БЛОК ДОДАНОГО ФУНКЦІОНАЛУ: ПІДРАХУНОК ДНІВ, ЩО ЗАЛИШИЛИСЬ
+# =======================================================
 def calc_days_left(end_iso: str) -> int:
+    """Повертає кількість повних днів, що залишились до end_iso (0, якщо термін минув)."""
     try:
         end_dt = datetime.fromisoformat(end_iso)
         if end_dt.tzinfo is None:
@@ -348,7 +462,7 @@ def calc_days_left(end_iso: str) -> int:
         return max(days, 0)
     except Exception:
         return 0
-
+# =======================================================
 
 # --- ТЕКСТИ ПОВІДОМЛЕНЬ ---
 
@@ -365,11 +479,13 @@ def get_text_start(lang="ua"):
             "• 🤖 **Персональний Signal Bot:** **$100 / 30 днів** *(Автоматичне підключення вашого акаунту OKX для миттєвої торгівлі)*\n\n"
             "⚠️ **Управління ризиками та відповідальність:**\n"
             "• 📈 Торгівля на криптовалютному ринку завжди пов'язана з високими ризиками.\n"
-            "• 🛡️ Обов'язково дотримуйтесь суворого **ризик- та мані-менеджменту**.\n"
-            "• ⚖️ Ми **не несемо відповідальності** за ваш баланс та фінансові результати.\n\n"
+            "• 🛡️ Обов'язково дотримуйтесь суворого **ризик- та мані-менеджменту** — контролюйте розмір плеча та закладайте безпечний відсоток депозиту на одну угоду.\n"
+            "• ⚖️ Ми **не несемо відповідальності** за ваш баланс та фінансові результати — ви повністю контролюєте власні кошти та самостійно приймаєте рішення.\n"
+            "• 🔥 Проте при дотриманні дисципліни, системного підходу та правил стратегії — це дає чудові результати!\n\n"
             "📜 **Правила спільноти:**\n"
             "• 🚫 Без спаму, флуду, реклами та реферальних посилань.\n"
-            "• 🤝 Ввічливе спілкування, без мату та токсичності.\n\n"
+            "• 🤝 Ввічливе спілкування, без мату та токсичності.\n"
+            "• 🛡️ Шахрайство = негайний бан.\n\n"
             "👇 **Обери потрібну дію з меню нижче:**"
         )
     return (
@@ -377,13 +493,21 @@ def get_text_start(lang="ua"):
         "I am **Mireya**, your personal assistant for the **Kerdos** trading system.\n\n"
         "🎁 **Special Offers & Bonuses:**\n"
         "• 🚀 **14-Day FREE Trial:** Every new user gets 2 weeks of free trial access to our Kerdos VIP Signals Group!\n"
-        "• 👥 **\"Refer a Friend\" Program:** Bring a friend and get **+14 days of free VIP access**!\n\n"
+        "• 👥 **\"Refer a Friend\" Program:** Bring a friend, and once they claim their free trial, get **+14 days of free VIP access**!\n\n"
         "💎 **Services & Pricing:**\n"
-        "• 📊 **Kerdos VIP Signals Group:** **$20 / 30 days**\n"
-        "• 🤖 **Personal Signal Bot Setup:** **$100 / 30 days**\n\n"
+        "• 📊 **Kerdos VIP Signals Group:** **$20 / 30 days** *(Market analytics, trade signals, and community access)*\n"
+        "• 🤖 **Personal Signal Bot Setup:** **$100 / 30 days** *(Direct OKX bot connection for automated signal execution)*\n\n"
+        "⚠️ **Risk Management & Disclaimer:**\n"
+        "• 📈 Cryptocurrency trading involves substantial financial risk.\n"
+        "• 🛡️ Always practice strict **risk and money management** — control your leverage and allocate a safe percentage of your capital per trade.\n"
+        "• ⚖️ We **are not responsible** for your balance or trading outcomes — you maintain full control over your funds and make decisions independently.\n"
+        "• 🔥 However, with proper discipline and strategic rule execution, it yields excellent long-term results!\n\n"
+        "📜 **Community Rules:**\n"
+        "• 🚫 No spam, flooding, self-promotion, or referral links.\n"
+        "• 🤝 Respectful communication, no profanity or toxicity.\n"
+        "• 🛡️ Fraudulent behavior results in an immediate permanent ban.\n\n"
         "👇 **Choose an option from the menu below:**"
     )
-
 
 def get_text_support_prompt(lang="ua"):
     if lang == "ua":
@@ -391,14 +515,16 @@ def get_text_support_prompt(lang="ua"):
             "🛟 **СЛУЖБА ПІДТРИМКИ KERDOS**\n\n"
             "Ви виявили помилку, маєте запитання щодо підписки або потребуєте допомоги з налаштуванням?\n\n"
             "📝 **Будь ласка, опишіть вашу проблему нижче в одному повідомленні:**\n"
-            "*(Ви також можете додати скріншот або фото помилки)*"
+            "*(Ви також можете додати скріншот або фото помилки)*\n\n"
+            "⏳ *Mireya одразу ж передасть ваше звернення адміністратору!*"
         )
     return (
         "🛟 **KERDOS SUPPORT HELPDESK**\n\n"
-        "Did you encounter an issue or have questions about your subscription?\n\n"
-        "📝 **Please describe your issue below in a single message:**"
+        "Did you encounter an issue, have questions about your subscription, or need setup assistance?\n\n"
+        "📝 **Please describe your issue below in a single message:**\n"
+        "*(You can also attach a screenshot or photo)*\n\n"
+        "⏳ *Mireya will forward your ticket directly to the administrator!*"
     )
-
 
 def get_text_vip_payment(lang="ua"):
     if lang == "ua":
@@ -408,8 +534,10 @@ def get_text_vip_payment(lang="ua"):
             f"🔸 **USDT (TRC20):**\n`{WALLET_USDT_TRC20}`\n\n"
             f"🔹 **USDT (BEP20 / BNB Chain):**\n`{WALLET_USDT_BEP20}`\n\n"
             f"🟣 **USDT (Solana):**\n`{WALLET_USDT_SOLANA}`\n\n"
+            "*(Натисніть на адресу, щоб її скопіювати)*\n\n"
             "📥 **ПІДТВЕРДЖЕННЯ ОПЛАТИ:**\n"
-            "Після виконання переказу **надішліть квитанцію (фото, скріншот або хеш) сюди в чат**."
+            "Після виконання переказу **надішліть квитанцію (фото, скріншот або текст з хешем транзакції) сюди в чат**.\n\n"
+            "Я (Mireya) передам її адміністратору на перевірку, і доступ буде надано!"
         )
     return (
         "💳 **Kerdos VIP Group Subscription ($20 / 30 days)**\n\n"
@@ -417,16 +545,21 @@ def get_text_vip_payment(lang="ua"):
         f"🔸 **USDT (TRC20):**\n`{WALLET_USDT_TRC20}`\n\n"
         f"🔹 **USDT (BEP20 / BNB Chain):**\n`{WALLET_USDT_BEP20}`\n\n"
         f"🟣 **USDT (Solana):**\n`{WALLET_USDT_SOLANA}`\n\n"
+        "*(Tap the address to copy it)*\n\n"
         "📥 **HOW TO CONFIRM PAYMENT:**\n"
-        "Send your receipt directly into this chat."
+        "After completing the transfer, **send the receipt (photo, screenshot, or transaction TxID) directly into this chat**.\n\n"
+        "I (Mireya) will forward it to the admin for verification!"
     )
-
 
 def get_text_bot_payment(lang="ua"):
     if lang == "ua":
         return (
             "🤖 **Підключення Kerdos Signal Bot ($100 / 30 днів)**\n\n"
             "Персональний бот для автоматичного виконання сигналів **Kerdos** на вашому акаунті OKX.\n\n"
+            "⚡ **Переваги:**\n"
+            "• Автоматичне відкриття/закриття угод 24/7\n"
+            "• Без передачі API-ключів (безпечно через Signal Token)\n"
+            "• Миттєва швидкість виконання сигналів\n\n"
             "💳 **Вартість:** **$100 / 30 днів**\n\n"
             "Перекажіть **100 USDT** на один із гаманців Binance:\n\n"
             f"🔸 **USDT (TRC20):**\n`{WALLET_USDT_TRC20}`\n\n"
@@ -437,13 +570,19 @@ def get_text_bot_payment(lang="ua"):
         )
     return (
         "🤖 **Connect Kerdos Signal Bot ($100 / 30 days)**\n\n"
-        "Price: **$100 / 30 days**\n\n"
+        "Automated bot for executing **Kerdos** signals directly on your OKX account.\n\n"
+        "⚡ **Benefits:**\n"
+        "• 24/7 automated trade execution\n"
+        "• Safe setup without sharing API keys (via Signal Token)\n"
+        "• Instant signal execution speed\n\n"
+        "💳 **Price:** **$100 / 30 days**\n\n"
+        "Send **100 USDT** to one of the Binance wallets below:\n\n"
         f"🔸 **USDT (TRC20):**\n`{WALLET_USDT_TRC20}`\n\n"
         f"🔹 **USDT (BEP20 / BNB Chain):**\n`{WALLET_USDT_BEP20}`\n\n"
         f"🟣 **USDT (Solana):**\n`{WALLET_USDT_SOLANA}`\n\n"
-        "Send your receipt into this chat."
+        "📥 **HOW TO CONFIRM PAYMENT:**\n"
+        "After transferring, **send your receipt (photo, screenshot, or TxID) into this chat**."
     )
-
 
 def get_text_services(lang="ua"):
     if lang == "ua":
@@ -453,14 +592,16 @@ def get_text_services(lang="ua"):
             "🤖 **Персональний Signal Bot:** **$100 / 30 днів**\n\n"
             "🎁 **Бонуси:**\n"
             "• **14 днів FREE** для нових користувачів!\n"
-            "• **+14 днів** за кожного запрошеного друга!"
+            "• **+14 днів** за кожного друга, який візьме безкоштовний пробний період!"
         )
     return (
         "💎 **Services & Pricing (Kerdos)**\n\n"
         "📊 **VIP Signals Group Access:** **$20 / 30 days**\n\n"
-        "🤖 **Personal Signal Bot Setup:** **$100 / 30 days**"
+        "🤖 **Personal Signal Bot Setup:** **$100 / 30 days**\n\n"
+        "🎁 **Bonuses:**\n"
+        "• **14-Day FREE Trial** for new users!\n"
+        "• **+14 Days Free Access** for every referred friend who claims their free trial!"
     )
-
 
 def get_text_rules(lang="ua"):
     if lang == "ua":
@@ -469,55 +610,86 @@ def get_text_rules(lang="ua"):
             "🚫 **Без спаму та флуду:** Масові розсилки заборонені.\n"
             "❌ **Заборона реклами:** Реклама без дозволу заборонена.\n"
             "🤝 **Повага та етика:** Образи та токсичність неприпустимі.\n"
+            "🤬 **Без нецензурної лексики:** Дотримуємося ввічливого спілкування.\n"
             "🛡️ **Без шахрайства:** Спроби скаму = бан."
         )
     return (
         "📜 **Kerdos Community Rules**\n\n"
-        "🚫 No Spam / Flooding\n❌ No Unapproved Ads\n🤝 Be Respectful\n🛡️ No Fraud"
+        "🚫 **No Spam or Flooding:** Mass messaging is prohibited.\n"
+        "❌ **No Advertising:** Self-promotion is forbidden.\n"
+        "🤝 **Respect & Courtesy:** Toxicity will not be tolerated.\n"
+        "🤬 **No Profanity:** Keep communication polite and clean.\n"
+        "🛡️ **No Scams:** Immediate permanent ban."
     )
-
 
 def get_text_choose_coin(lang="ua"):
     if lang == "ua":
         return (
             "🪙 **Оберіть монету для Signal Bot**\n\n"
-            "Ваш Signal Bot працює з обраною монетою. Оберіть торгову пару з переліку:"
+            "Ваш Signal Bot працює лише з **однією монетою**. Оберіть, за якою парою ви хочете отримувати "
+            "автоматичні сигнали (у дужках — ROI за минулий місяць за даними щомісячного звіту Kerdos):"
         )
     return (
         "🪙 **Choose a coin for your Signal Bot**\n\n"
-        "Select your preferred trading pair below:"
+        "Your Signal Bot works with **one coin only**. Pick the pair you want automated signals for "
+        "(the number in brackets is last month's ROI from the Kerdos monthly report):"
     )
-
 
 def get_text_coin_selected(ticker: str, lang="ua"):
     display = ticker.replace("USDT", "")
     if lang == "ua":
         return (
             f"✅ **Монету обрано: {display}**\n\n"
-            "Тепер, будь ласка, надайте ваш **Signal Token** з OKX.\n\n"
+            "Тепер, будь ласка, надайте ваш **Signal Token**.\n\n"
+            "📍 **Де знайти Signal Token на OKX:**\n"
+            "1. Зайдіть на біржу **OKX** ➔ розділ **Торгувати (Trade)** ➔ **Торгові боти (Trading Bots)**.\n"
+            "2. Оберіть **Сигнальний бот (Signal Bot)** ➔ **Створити власні сигнали (Create Custom Signal)**.\n"
+            "3. Введіть назву сигналу (наприклад, `Kerdos Signals`) та натисніть **Створити**.\n"
+            "4. Скопіюйте рядок **Signal Token** з налаштувань бота.\n\n"
             "📥 **Надішліть ваш токен у цей чат у такому форматі:**\n"
-            "`Token: ваш_signal_token_тут`"
+            "`Token: ваш_signal_token_тут`\n\n"
+            "⏳ *Наш адміністратор вручну додасть ваш токен до сповіщень TradingView для обраної монети.*"
         )
     return (
         f"✅ **Coin selected: {display}**\n\n"
-        "Now send your OKX **Signal Token** using the format:\n"
-        "`Token: your_signal_token_here`"
+        "Now please provide your **Signal Token**.\n\n"
+        "📍 **Where to find Signal Token on OKX:**\n"
+        "1. Go to **OKX** ➔ **Trade** ➔ **Trading Bots**.\n"
+        "2. Select **Signal Bot** ➔ **Create Custom Signal**.\n"
+        "3. Name your signal (e.g., `Kerdos Signals`) and click **Create**.\n"
+        "4. Copy the **Signal Token** string from the bot settings.\n\n"
+        "📥 **Send your token in this chat using the format:**\n"
+        "`Token: your_signal_token_here`\n\n"
+        "⏳ *Our admin will manually add your token to the TradingView alert for your chosen coin.*"
     )
-
 
 def get_text_token_saved(lang="ua"):
     if lang == "ua":
-        return "✅ **Signal Token отримано!** Адміністратор підключить його найближчим часом."
-    return "✅ **Signal Token received!** The admin will integrate it shortly."
-
+        return (
+            "✅ **Signal Token отримано!**\n\n"
+            "Ваш токен передано для інтеграції з системою сповіщень TradingView.\n\n"
+            "⏳ Процес налаштування буде завершено протягом поточного дня."
+        )
+    return (
+        "✅ **Signal Token received!**\n\n"
+        "Your token has been submitted for integration with the TradingView alert system.\n\n"
+        "⏳ The setup process will be completed within the day.."
+    )
 
 def get_text_token_invalid(lang="ua"):
     if lang == "ua":
-        return "⚠️ **Токен занадто короткий.** Надішліть токен у форматі:\n`Token: ваш_signal_token_тут`"
-    return "⚠️ **Invalid token.** Format required:\n`Token: your_signal_token_here`"
+        return (
+            "⚠️ **Токен виглядає порожнім або занадто коротким.**\n\n"
+            "Будь ласка, скопіюйте повний **Signal Token** з OKX і надішліть його у форматі:\n"
+            "`Token: ваш_signal_token_тут`"
+        )
+    return (
+        "⚠️ **The token looks empty or too short.**\n\n"
+        "Please copy the full **Signal Token** from OKX and send it in the format:\n"
+        "`Token: your_signal_token_here`"
+    )
 
-
-# --- РЕФЕРАЛЬНА ПРОГРАМА ТА ТРИАЛ ---
+# --- РЕФЕРАЛЬНА ПРОГРАМА ТА ЛОГІКА ТРИАЛУ ---
 
 async def get_referral_text(user_id: int, bot_username: str, lang: str = "ua") -> str:
     ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
@@ -530,17 +702,18 @@ async def get_referral_text(user_id: int, bot_username: str, lang: str = "ua") -
     if lang == "ua":
         return (
             "👥 **Реферальна програма Kerdos «Приведи друга»**\n\n"
-            "Отримуйте **+14 днів безкоштовного доступу** за кожного друга, який активує безкоштовний пробний період!\n\n"
-            f"🔗 **Ваше посилання:**\n`{ref_link}`\n\n"
-            f"📊 **Запрошено друзів (активували FREE):** {active_refs}"
+            "Запрошуйте друзів та отримуйте **+14 днів безкоштовного доступу** до VIP-групи за кожного друга, який активує безкоштовний пробний період!\n\n"
+            f"🔗 **Ваше персональне посилання:**\n`{ref_link}`\n\n"
+            f"📊 **Ваші запрошені друзі, які взяли FREE-триал:** {active_refs}\n\n"
+            "*(Натисніть на посилання, щоб скопіювати його та поділитися з друзями)*"
         )
     return (
-        "👥 **Kerdos Referral Program**\n\n"
-        "Get **+14 days of free VIP access** per referred friend!\n\n"
-        f"🔗 **Your link:**\n`{ref_link}`\n\n"
-        f"📊 **Active referrals:** {active_refs}"
+        "👥 **Kerdos Referral Program \"Refer a Friend\"**\n\n"
+        "Invite your friends and receive **+14 days of free VIP access** for every friend who activates their free trial!\n\n"
+        f"🔗 **Your personal referral link:**\n`{ref_link}`\n\n"
+        f"📊 **Friends who claimed FREE trial:** {active_refs}\n\n"
+        "*(Tap the link to copy and share it with your friends)*"
     )
-
 
 async def handle_free_trial_request(user_id: int, username: str, lang: str = "ua"):
     now = datetime.now(timezone.utc)
@@ -552,8 +725,8 @@ async def handle_free_trial_request(user_id: int, username: str, lang: str = "ua
 
         if user and user[0] == 1:
             if lang == "ua":
-                return "⚠️ **Ви вже використовували безкоштовний 14-денний період.**"
-            return "⚠️ **You have already used your free trial.**"
+                return "⚠️ **Ви вже використовували безкоштовний 14-денний період.**\n\nВи можете оформити підписку у головному меню."
+            return "⚠️ **You have already used your 14-day free trial.**\n\nYou can subscribe in the main menu."
 
         referrer_id = user[1] if user else None
 
@@ -578,6 +751,7 @@ async def handle_free_trial_request(user_id: int, username: str, lang: str = "ua
             """, (user_id, username, now.isoformat(), trial_end.isoformat(), lang))
             await db.commit()
 
+            # --- АВТОМАТИЧНЕ НАРАХУВАННЯ БОНУСУ ЗАПРОШУЮЧОМУ ---
             if referrer_id:
                 async with db.execute("SELECT trial_end, sub_end, status, lang FROM users WHERE user_id = ?", (referrer_id,)) as cursor:
                     ref_user = await cursor.fetchone()
@@ -609,11 +783,12 @@ async def handle_free_trial_request(user_id: int, username: str, lang: str = "ua
                     safe_username = escape_md(username)
                     bonus_msg = (
                         f"🥳 **Ваш друг (@{safe_username}) взяв безкоштовний тестовий період!**\n\n"
-                        f"🎁 Вам нараховано **+14 днів доступу** до Kerdos VIP!\n"
-                        f"⏰ Новий термін дії: **{new_end.strftime('%Y-%m-%d %H:%M UTC')}**"
+                        f"🎁 Вам автоматично нараховано **+14 днів безкоштовного доступу** до Kerdos VIP!\n"
+                        f"⏰ Новий термін дії доступу: **{new_end.strftime('%Y-%m-%d %H:%M UTC')}**"
                         if ref_lang == "ua" else
                         f"🥳 **Your friend (@{safe_username}) claimed their free trial!**\n\n"
-                        f"🎁 You received **+14 days** of Kerdos VIP access!"
+                        f"🎁 You have automatically received **+14 free days** of Kerdos VIP access!\n"
+                        f"⏰ New expiration date: **{new_end.strftime('%Y-%m-%d %H:%M UTC')}**"
                     )
                     try:
                         await bot.send_message(chat_id=referrer_id, text=bonus_msg, parse_mode="Markdown")
@@ -623,19 +798,27 @@ async def handle_free_trial_request(user_id: int, username: str, lang: str = "ua
             if lang == "ua":
                 return (
                     f"🎉 **Вам надано 14 днів безкоштовного доступу до Kerdos VIP!**\n\n"
-                    f"🔗 **Ваше посилання для входу:**\n{invite_link.invite_link}\n\n"
+                    f"🔗 **Ваше одноразове посилання:**\n{invite_link.invite_link}\n\n"
                     f"⏰ Доступ активний до: **{trial_end.strftime('%Y-%m-%d %H:%M UTC')}**"
                 )
             return (
-                f"🎉 **You have been granted 14 days of free VIP access!**\n\n"
-                f"🔗 **Your invite link:**\n{invite_link.invite_link}"
+                f"🎉 **You have been granted 14 days of free access to Kerdos VIP!**\n\n"
+                f"🔗 **Your invite link:**\n{invite_link.invite_link}\n\n"
+                f"⏰ Access valid until: **{trial_end.strftime('%Y-%m-%d %H:%M UTC')}**"
             )
         except Exception as e:
             logger.error(f"Error creating invite link for user {user_id}: {e}")
-            return "❌ Помилка при створенні посилання. Переконайся, що бот доданий у групу як адмін."
+            return "❌ Помилка при створенні посилання. Переконайся, що Mireya додана у групу як адмін."
 
+# --- ПЕРЕСИЛАННЯ SIGNAL TOKEN АДМІНУ ДЛЯ РУЧНОГО ДОДАВАННЯ В TRADINGVIEW ---
 
 async def forward_token_to_admin(user_id: int, username: str, token: str):
+    """
+    Замість автоматичної відправки сигналів на OKX, бот просто пересилає
+    отриманий Signal Token адміну. Адмін вручну додає цей токен окремим
+    рядком сповіщення (alert) у TradingView (для обраної користувачем монети),
+    і TradingView вже напряму відправляє сигнал на OKX для цього користувача.
+    """
     if not ADMIN_TELEGRAM_ID or not bot:
         return
 
@@ -651,14 +834,16 @@ async def forward_token_to_admin(user_id: int, username: str, token: str):
         f"👤 **Користувач:** {user_disp}\n"
         f"🆔 **ID:** `{user_id}`\n"
         f"🪙 **Обрана монета:** `{selected_coin}`\n\n"
-        f"📋 **Token:**\n`{escape_md(token)}`"
+        "📋 **Token (натисніть, щоб скопіювати):**\n"
+        f"`{escape_md(token)}`\n\n"
+        f"➡️ Додайте цей токен окремим рядком у сповіщення (Alert Message) TradingView для `{selected_coin}`, "
+        "щоб цей користувач отримував сигнали напряму на OKX."
     )
 
     try:
         await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=admin_text, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Не вдалося переслати token адміну для user {user_id}: {e}")
-
 
 # --- ВЕБХУК TELEGRAM ---
 
@@ -680,26 +865,36 @@ async def telegram_webhook(request: Request):
             user_lang = await get_user_lang(user_id)
             is_awaiting_support = await get_awaiting_support(user_id)
 
-            # Введення Signal Token
+            # Обробка введення Signal Token (формат Token: xxx)
             if update.message.text and update.message.text.strip().lower().startswith("token:"):
                 raw_token = update.message.text.strip().split(":", 1)[1].strip()
 
+                # =======================================================
+                # БЛОК ДОДАНОГО ФУНКЦІОНАЛУ: ВАЛІДАЦІЯ ДОВЖИНИ ТОКЕНА
+                # =======================================================
                 if len(raw_token) < 10:
-                    await bot.send_message(chat_id=chat_id, text=get_text_token_invalid(user_lang), parse_mode="Markdown")
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=get_text_token_invalid(user_lang),
+                        parse_mode="Markdown"
+                    )
                     return {"status": "ok"}
+                # =======================================================
 
                 async with aiosqlite.connect(DB_PATH) as db:
                     await db.execute("UPDATE users SET signal_token = ? WHERE user_id = ?", (raw_token, user_id))
                     await db.commit()
 
+                # Пересилаємо токен адміну для ручного додавання у TradingView
                 await forward_token_to_admin(user_id, username, raw_token)
+
                 await bot.send_message(chat_id=chat_id, text=get_text_token_saved(user_lang), parse_mode="Markdown")
                 return {"status": "ok"}
 
-            # Команди
+            # Команди та рефералка
             if update.message.text and update.message.text.startswith("/"):
                 text = update.message.text.strip()
-                await set_awaiting_support(user_id, 0)
+                await set_awaiting_support(user_id, 0) # Скидаємо очікування підтримки при використанні команд
 
                 if text.startswith("/start"):
                     args = text.split()
@@ -728,6 +923,9 @@ async def telegram_webhook(request: Request):
                     await bot.send_message(chat_id=chat_id, text=get_text_rules(user_lang), reply_markup=get_back_keyboard(user_lang), parse_mode="Markdown")
                     return {"status": "ok"}
 
+                # =======================================================
+                # БЛОК ДОДАНОГО ФУНКЦІОНАЛУ: АДМІН-КОМАНДИ
+                # =======================================================
                 elif text == "/admin" and ADMIN_TELEGRAM_ID and user_id == ADMIN_TELEGRAM_ID:
                     await bot.send_message(
                         chat_id=chat_id,
@@ -745,6 +943,11 @@ async def telegram_webhook(request: Request):
                         new_end = now + timedelta(days=30)
 
                         async with aiosqlite.connect(DB_PATH) as db:
+                            # =======================================================
+                            # ФІКС БАГ #1: INSERT ... ON CONFLICT замість голого UPDATE,
+                            # інакше видача доступу користувачу, якого ще немає в БД,
+                            # оновлює 0 рядків і доступу фактично не буде.
+                            # =======================================================
                             await db.execute("""
                                 INSERT INTO users (user_id, status, sub_end)
                                 VALUES (?, 'VIP', ?)
@@ -776,7 +979,7 @@ async def telegram_webhook(request: Request):
                             parse_mode="Markdown"
                         )
                     else:
-                        await bot.send_message(chat_id=chat_id, text="Формат: `/give_vip 123456789`", parse_mode="Markdown")
+                        await bot.send_message(chat_id=chat_id, text="Помилка. Використовуйте формат: `/give_vip 123456789`", parse_mode="Markdown")
                     return {"status": "ok"}
 
                 elif text.startswith("/give_bot") and ADMIN_TELEGRAM_ID and user_id == ADMIN_TELEGRAM_ID:
@@ -787,6 +990,9 @@ async def telegram_webhook(request: Request):
                         new_end = now + timedelta(days=30)
 
                         async with aiosqlite.connect(DB_PATH) as db:
+                            # =======================================================
+                            # ФІКС БАГ #1: те саме для /give_bot
+                            # =======================================================
                             await db.execute("""
                                 INSERT INTO users (user_id, status, bot_sub_end)
                                 VALUES (?, 'BOT', ?)
@@ -806,24 +1012,32 @@ async def telegram_webhook(request: Request):
                                 safe_token_snip = f"{escape_md(user_token[:6])}...{escape_md(user_token[-4:])}"
                                 user_msg = (
                                     f"🎉 **Адміністратор надав вам доступ до Kerdos Signal Bot на 30 днів!**\n\n"
+                                    f"✅ Ваш Signal Token вже наявний у системі та переданий адміну для підключення.\n"
                                     f"🔑 **Токен:** `{safe_token_snip}`"
                                     if target_lang == "ua" else
-                                    f"🎉 **Admin granted you Kerdos Signal Bot access for 30 days!**"
+                                    f"🎉 **Admin granted you Kerdos Signal Bot access for 30 days!**\n\n"
+                                    f"✅ Your Signal Token is already on file and has been passed along for setup.\n"
+                                    f"🔑 **Token:** `{safe_token_snip}`"
                                 )
                                 await bot.send_message(chat_id=target_user_id, text=user_msg, parse_mode="Markdown")
+                                # На випадок, якщо токен ще не пересилався — пересилаємо ще раз
                                 await forward_token_to_admin(target_user_id, "", user_token)
                             else:
-                                intro_msg = "🎉 **Адміністратор надав вам доступ до Kerdos Signal Bot на 30 днів!**"
+                                intro_msg = (
+                                    "🎉 **Адміністратор надав вам доступ до Kerdos Signal Bot на 30 днів!**"
+                                    if target_lang == "ua" else
+                                    "🎉 **Admin granted you Kerdos Signal Bot access for 30 days!**"
+                                )
                                 await bot.send_message(chat_id=target_user_id, text=intro_msg, parse_mode="Markdown")
                                 await bot.send_message(
                                     chat_id=target_user_id,
                                     text=get_text_choose_coin(target_lang),
-                                    reply_markup=get_coin_selection_keyboard(),
+                                    reply_markup=await get_coin_selection_keyboard(target_lang),
                                     parse_mode="Markdown"
                                 )
-                            notification_status = "📤 Користувачу надіслано сповіщення."
+                            notification_status = "📤 Користувачу надіслано сповіщення та інструкцію."
                         except Exception as e:
-                            notification_status = f"⚠️ Доступ оновлено в БД: {e}"
+                            notification_status = f"⚠️ Доступ оновлено в БД, але не вдалося написати користувачу: {e}"
 
                         await bot.send_message(
                             chat_id=chat_id,
@@ -831,21 +1045,67 @@ async def telegram_webhook(request: Request):
                             parse_mode="Markdown"
                         )
                     else:
-                        await bot.send_message(chat_id=chat_id, text="Формат: `/give_bot 123456789`", parse_mode="Markdown")
+                        await bot.send_message(chat_id=chat_id, text="Помилка. Використовуйте формат: `/give_bot 123456789`", parse_mode="Markdown")
                     return {"status": "ok"}
 
-            # ОБРОБКА ЗВЕРНЕННЯ В ПІДТРИМКУ (ВИПРАВЛЕНО ТУТ)
+                # =======================================================
+                # БЛОК ДОДАНОГО ФУНКЦІОНАЛУ: ADMIN ROI-КОМАНДИ (щомісячний звіт)
+                # =======================================================
+                elif text.startswith("/set_roi") and ADMIN_TELEGRAM_ID and user_id == ADMIN_TELEGRAM_ID:
+                    parts = text.split()
+                    if len(parts) == 3:
+                        ticker_raw = parts[1].upper()
+                        try:
+                            roi_value = float(parts[2].replace(",", "."))
+                        except ValueError:
+                            await bot.send_message(chat_id=chat_id, text="Помилка. ROI має бути числом, напр. `/set_roi BTCUSDT 12.5`", parse_mode="Markdown")
+                            return {"status": "ok"}
+
+                        if ticker_raw not in AVAILABLE_COINS:
+                            await bot.send_message(
+                                chat_id=chat_id,
+                                text=f"Помилка. `{ticker_raw}` немає у списку доступних монет.",
+                                parse_mode="Markdown"
+                            )
+                            return {"status": "ok"}
+
+                        await set_coin_roi(ticker_raw, roi_value)
+                        sign = "+" if roi_value >= 0 else ""
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=f"✅ ROI для `{ticker_raw}` встановлено: **{sign}{roi_value:.1f}%** (за минулий місяць).",
+                            parse_mode="Markdown"
+                        )
+                    else:
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text="Помилка. Використовуйте формат: `/set_roi TICKER VALUE`\n*(Наприклад: /set_roi BTCUSDT 12.5)*",
+                            parse_mode="Markdown"
+                        )
+                    return {"status": "ok"}
+
+                elif text == "/roi_list" and ADMIN_TELEGRAM_ID and user_id == ADMIN_TELEGRAM_ID:
+                    roi_map = await get_all_coin_roi()
+                    lines = ["📊 *Поточний ROI за монетами (щомісячний звіт):*\n"]
+                    for ticker in AVAILABLE_COINS:
+                        roi = roi_map.get(ticker)
+                        if roi is None:
+                            lines.append(f"• `{ticker}` — н/д")
+                        else:
+                            sign = "+" if roi >= 0 else ""
+                            lines.append(f"• `{ticker}` — {sign}{roi:.1f}%")
+                    lines.append("\nОновити: `/set_roi TICKER VALUE`")
+                    await bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode="Markdown")
+                    return {"status": "ok"}
+                # =======================================================
+
+            # 📩 ОБРОБКА ЗВЕРНЕННЯ В ПІДТРИМКУ
             if is_awaiting_support == 1 and ADMIN_TELEGRAM_ID and user_id != ADMIN_TELEGRAM_ID:
                 await set_awaiting_support(user_id, 0)
 
-                # Замість tg://user?id= використовуємо посилання на username якщо він є, або callback_data
-                if username and username != "no_username":
-                    user_link = f"https://t.me/{username}"
-                    admin_keyboard = InlineKeyboardMarkup([
-                        [InlineKeyboardButton("💬 Написати користувачу", url=user_link)]
-                    ])
-                else:
-                    admin_keyboard = None
+                admin_keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💬 Ввійти в чат / Відповісти", url=f"tg://user?id={user_id}")]
+                ])
 
                 safe_username = escape_md(username)
                 support_header = f"🛟 **НОВЕ ЗВЕРНЕННЯ В ПІДТРИМКУ!**\n\n👤 **Від:** @{safe_username}\n🆔 **ID:** `{user_id}`\n🌐 **Мова:** {user_lang.upper()}\n"
@@ -870,14 +1130,14 @@ async def telegram_webhook(request: Request):
                     )
 
                 confirm_text = (
-                    "🚀 **Ваше звернення успішно передано адміністратору!**"
+                    "🚀 **Ваше звернення успішно передано адміністратору!**\n\nМи розглянемо його найближчим часом та зв'яжемося з вами."
                     if user_lang == "ua" else
-                    "🚀 **Your support request has been delivered to the admin!**"
+                    "🚀 **Your support request has been delivered to the admin!**\n\nWe will review it and get back to you shortly."
                 )
                 await bot.send_message(chat_id=chat_id, text=confirm_text, reply_markup=get_back_keyboard(user_lang), parse_mode="Markdown")
                 return {"status": "ok"}
 
-            # ОБРОБКА КВИТАНЦІЙ ПРО ОПЛАТУ
+            # 💳 ОБРОБКА КВИТАНЦІЙ ПРО ОПЛАТУ
             if ADMIN_TELEGRAM_ID and user_id != ADMIN_TELEGRAM_ID:
                 admin_keyboard = InlineKeyboardMarkup([
                     [
@@ -899,7 +1159,7 @@ async def telegram_webhook(request: Request):
                         reply_markup=admin_keyboard,
                         parse_mode="Markdown"
                     )
-                    reply_msg = "✅ **Вашу квитанцію отримано!** Адміністратор перевірить її найближчим часом." if user_lang == "ua" else "✅ **Receipt received!**"
+                    reply_msg = "✅ **Вашу квитанцію (фото) отримано!** Адміністратор перевірить її найближчим часом." if user_lang == "ua" else "✅ **Receipt received!** The admin will review it shortly."
                     await bot.send_message(chat_id=chat_id, text=reply_msg)
                     return {"status": "ok"}
 
@@ -911,7 +1171,7 @@ async def telegram_webhook(request: Request):
                         reply_markup=admin_keyboard,
                         parse_mode="Markdown"
                     )
-                    reply_msg = "✅ **Вашу квитанцію отримано!** Адміністратор перевірить її найближчим часом." if user_lang == "ua" else "✅ **Receipt received!**"
+                    reply_msg = "✅ **Вашу квитанцію отримано!** Адміністратор перевірить її найближчим часом." if user_lang == "ua" else "✅ **Receipt received!** The admin will review it shortly."
                     await bot.send_message(chat_id=chat_id, text=reply_msg)
                     return {"status": "ok"}
 
@@ -958,6 +1218,11 @@ async def telegram_webhook(request: Request):
                 await query.edit_message_text(text=get_text_bot_payment(user_lang), reply_markup=get_back_keyboard(user_lang), parse_mode="Markdown")
 
             elif data == "btn_referral":
+                # =======================================================
+                # ФІКС БАГ #3: username бота кешується один раз (у lifespan,
+                # з фолбеком тут якщо кеш ще порожній), а не запитується
+                # у Telegram щоразу на клік по цій кнопці.
+                # =======================================================
                 if not BOT_USERNAME:
                     try:
                         me = await bot.get_me()
@@ -981,22 +1246,36 @@ async def telegram_webhook(request: Request):
                 else:
                     status, t_end, s_end, b_end, token, selected_coin = row
                     status_label = status.upper() if status else "FREE"
-                    sub_info = f"📊 **Статус:** `{status_label}`\n\n" if user_lang == "ua" else f"📊 **Status:** `{status_label}`\n\n"
+                    sub_info = (
+                        f"📊 **Статус:** `{status_label}`\n\n"
+                        if user_lang == "ua" else
+                        f"📊 **Status:** `{status_label}`\n\n"
+                    )
 
                     if t_end:
                         days_left = calc_days_left(t_end)
-                        sub_info += f"🎁 **Триал:** залишилось {days_left} дн.\n" if user_lang == "ua" else f"🎁 **Trial:** {days_left} days left\n"
+                        if user_lang == "ua":
+                            sub_info += f"🎁 **Триал:** залишилось {days_left} дн. (до {t_end[:16].replace('T', ' ')} UTC)\n"
+                        else:
+                            sub_info += f"🎁 **Trial:** {days_left} days left (until {t_end[:16].replace('T', ' ')} UTC)\n"
 
                     if s_end:
                         days_left = calc_days_left(s_end)
-                        sub_info += f"💎 **VIP-група:** залишилось {days_left} дн.\n" if user_lang == "ua" else f"💎 **VIP Group:** {days_left} days left\n"
+                        if user_lang == "ua":
+                            sub_info += f"💎 **VIP-група:** залишилось {days_left} дн. (до {s_end[:16].replace('T', ' ')} UTC)\n"
+                        else:
+                            sub_info += f"💎 **VIP Group:** {days_left} days left (until {s_end[:16].replace('T', ' ')} UTC)\n"
 
                     if b_end:
                         days_left = calc_days_left(b_end)
-                        sub_info += f"🤖 **Signal Bot:** залишилось {days_left} дн.\n" if user_lang == "ua" else f"🤖 **Signal Bot:** {days_left} days left\n"
+                        if user_lang == "ua":
+                            sub_info += f"🤖 **Signal Bot:** залишилось {days_left} дн. (до {b_end[:16].replace('T', ' ')} UTC)\n"
+                        else:
+                            sub_info += f"🤖 **Signal Bot:** {days_left} days left (until {b_end[:16].replace('T', ' ')} UTC)\n"
 
                     if selected_coin:
-                        sub_info += f"🪙 **Монета:** `{selected_coin}`\n"
+                        coin_label = "🪙 **Монета:**" if user_lang == "ua" else "🪙 **Coin:**"
+                        sub_info += f"{coin_label} `{selected_coin}`\n"
 
                     if token:
                         sub_info += f"🔑 **OKX Token:** `{escape_md(token[:6])}...{escape_md(token[-4:])}`"
@@ -1012,56 +1291,100 @@ async def telegram_webhook(request: Request):
                         reply_markup=get_back_keyboard(user_lang),
                         parse_mode="Markdown"
                     )
+                else:
+                    await query.answer("Невідома монета." if user_lang == "ua" else "Unknown coin.", show_alert=True)
+
+            # =======================================================
+            # БЛОК ДОДАНОГО ФУНКЦІОНАЛУ: ОБРОБКА КНОПОК АДМІН-ПАНЕЛІ
+            # =======================================================
 
             elif data.startswith("admin_"):
                 if user_id != ADMIN_TELEGRAM_ID:
-                    await query.answer("Немає доступу!", show_alert=True)
+                    await query.answer("У вас немає доступу до цієї функції!", show_alert=True)
                     return {"status": "ok"}
 
                 if data == "admin_users_list":
                     async with aiosqlite.connect(DB_PATH) as db:
                         async with db.execute("""
                             SELECT user_id, username, status, trial_end, sub_end, bot_sub_end
-                            FROM users ORDER BY user_id DESC LIMIT 30
+                            FROM users
+                            ORDER BY user_id DESC
+                            LIMIT 30
                         """) as cursor:
                             users = await cursor.fetchall()
 
                     if not users:
                         text = "📊 База користувачів порожня."
                     else:
-                        text = "📊 *Останні користувачі:*\n\n"
+                        text = "📊 *Останні користувачі та їх активні послуги:*\n\n"
+                        now_utc = datetime.now(timezone.utc)
 
                         for u_id, u_name, u_status, t_end, s_end, b_end in users:
                             u_name_disp = f"@{escape_md(u_name)}" if u_name and u_name != "no_username" else f"ID: `{u_id}`"
                             services = []
 
-                            if t_end and calc_days_left(t_end) > 0:
-                                services.append(f"⏳ Тріал: {calc_days_left(t_end)} дн.")
-                            if s_end and calc_days_left(s_end) > 0:
-                                services.append(f"💎 VIP: {calc_days_left(s_end)} дн.")
-                            if b_end and calc_days_left(b_end) > 0:
-                                services.append(f"🤖 Bot: {calc_days_left(b_end)} дн.")
+                            if t_end:
+                                try:
+                                    t_dt = datetime.fromisoformat(t_end)
+                                    if t_dt.tzinfo is None: t_dt = t_dt.replace(tzinfo=timezone.utc)
+                                    if t_dt > now_utc:
+                                        days_left = calc_days_left(t_end)
+                                        services.append(f"⏳ Тріал: {days_left} дн. (до {t_dt.strftime('%d.%m')})")
+                                except Exception: pass
+
+                            if s_end:
+                                try:
+                                    s_dt = datetime.fromisoformat(s_end)
+                                    if s_dt.tzinfo is None: s_dt = s_dt.replace(tzinfo=timezone.utc)
+                                    if s_dt > now_utc:
+                                        days_left = calc_days_left(s_end)
+                                        services.append(f"💎 VIP: {days_left} дн. (до {s_dt.strftime('%d.%m')})")
+                                except Exception: pass
+
+                            if b_end:
+                                try:
+                                    b_dt = datetime.fromisoformat(b_end)
+                                    if b_dt.tzinfo is None: b_dt = b_dt.replace(tzinfo=timezone.utc)
+                                    if b_dt > now_utc:
+                                        days_left = calc_days_left(b_end)
+                                        services.append(f"🤖 Bot: {days_left} дн. (до {b_dt.strftime('%d.%m')})")
+                                except Exception: pass
 
                             services_str = " | ".join(services) if services else "немає активних послуг"
-                            text += f"👤 {u_name_disp} — Status: `{u_status}`\n└ {services_str}\n\n"
+                            status_disp = u_status.upper() if u_status else "FREE"
+                            text += f"👤 {u_name_disp} — Статус: `{status_disp}`\n└ {services_str}\n\n"
 
                     await query.edit_message_text(text=text, reply_markup=get_admin_panel_keyboard(), parse_mode="Markdown")
 
                 elif data == "admin_grant_vip":
                     await query.edit_message_text(
-                        text="Для надання VIP, надішліть команду:\n`/give_vip USER_ID`",
+                        text="Для надання VIP доступу, надішліть команду в чат у форматі:\n`/give_vip USER_ID`\n*(Наприклад: /give_vip 123456789)*",
                         reply_markup=get_admin_panel_keyboard(),
                         parse_mode="Markdown"
                     )
 
                 elif data == "admin_grant_bot":
                     await query.edit_message_text(
-                        text="Для надання доступу до Signal Bot, надішліть команду:\n`/give_bot USER_ID`",
+                        text="Для надання доступу до Signal Bot, надішліть команду в чат у форматі:\n`/give_bot USER_ID`\n*(Наприклад: /give_bot 123456789)*",
                         reply_markup=get_admin_panel_keyboard(),
                         parse_mode="Markdown"
                     )
 
-            # АДМІНСЬКІ ДІЇ ПІДТВЕРДЖЕННЯ
+                elif data == "admin_roi_info":
+                    roi_map = await get_all_coin_roi()
+                    lines = ["📈 *Поточний ROI за монетами (щомісячний звіт):*\n"]
+                    for ticker in AVAILABLE_COINS:
+                        roi = roi_map.get(ticker)
+                        if roi is None:
+                            lines.append(f"• `{ticker}` — н/д")
+                        else:
+                            sign = "+" if roi >= 0 else ""
+                            lines.append(f"• `{ticker}` — {sign}{roi:.1f}%")
+                    lines.append("\nОновити одну монету: `/set_roi TICKER VALUE`\n*(Наприклад: /set_roi BTCUSDT 12.5)*")
+                    await query.edit_message_text(text="\n".join(lines), reply_markup=get_admin_panel_keyboard(), parse_mode="Markdown")
+            # =======================================================
+
+            # АДМІНСЬКІ ДІЇ (ПІДТВЕРДЖЕННЯ / ВІДХИЛЕННЯ)
             elif data.startswith(("approve_vip_", "approve_bot_", "decline_")) and user_id == ADMIN_TELEGRAM_ID:
                 action_type, target_user_id = data.rsplit("_", 1)
                 target_user_id = int(target_user_id)
@@ -1077,7 +1400,7 @@ async def telegram_webhook(request: Request):
                         invite_link = await bot.create_chat_invite_link(chat_id=TELEGRAM_CHANNEL_ID, member_limit=1) if TELEGRAM_CHANNEL_ID else None
                         link_str = invite_link.invite_link if invite_link else "Перевірте канал."
 
-                        user_msg = f"🎉 **Оплату VIP-групи підтверджено!**\n\n🔗 Посилання: {link_str}" if target_lang == "ua" else f"🎉 **VIP approved!**\n\n🔗 Link: {link_str}"
+                        user_msg = f"🎉 **Оплату VIP-групи підтверджено!**\n\n🔗 Ваше посилання для входу: {link_str}" if target_lang == "ua" else f"🎉 **VIP payment approved!**\n\n🔗 Link: {link_str}"
                         await bot.send_message(chat_id=target_user_id, text=user_msg)
                         await query.edit_message_text(text=f"✅ VIP підтверджено для ID: `{target_user_id}`")
 
@@ -1085,18 +1408,22 @@ async def telegram_webhook(request: Request):
                         await db.execute("UPDATE users SET bot_sub_end = ? WHERE user_id = ?", (new_end.isoformat(), target_user_id))
                         await db.commit()
 
-                        approve_intro = "🎉 **Оплату Kerdos Signal Bot підтверджено!**" if target_lang == "ua" else "🎉 **Kerdos Signal Bot approved!**"
+                        approve_intro = (
+                            "🎉 **Оплату Kerdos Signal Bot підтверджено!**"
+                            if target_lang == "ua" else
+                            "🎉 **Kerdos Signal Bot payment approved!**"
+                        )
                         await bot.send_message(chat_id=target_user_id, text=approve_intro, parse_mode="Markdown")
                         await bot.send_message(
                             chat_id=target_user_id,
                             text=get_text_choose_coin(target_lang),
-                            reply_markup=get_coin_selection_keyboard(),
+                            reply_markup=await get_coin_selection_keyboard(target_lang),
                             parse_mode="Markdown"
                         )
                         await query.edit_message_text(text=f"✅ Signal Bot підтверджено для ID: `{target_user_id}`")
 
                     elif action_type == "decline":
-                        user_msg = "❌ **Вашу квитанцію відхилено.**" if target_lang == "ua" else "❌ **Receipt declined.**"
+                        user_msg = "❌ **Вашу квитанцію відхилено.** Якщо ви виявили помилку, зверніться до підтримки." if target_lang == "ua" else "❌ **Receipt declined.** Please contact support if you believe this is an error."
                         await bot.send_message(chat_id=target_user_id, text=user_msg)
                         await query.edit_message_text(text=f"❌ Оплату відхилено для ID: `{target_user_id}`")
 
@@ -1104,3 +1431,103 @@ async def telegram_webhook(request: Request):
         logger.error(f"Error handling Telegram webhook: {e}")
 
     return {"status": "ok"}
+
+# --- ЕНДПОІНТ ДЛЯ ПРИЙОМУ СИГНАЛІВ З TRADINGVIEW (WEBHOOK) ---
+
+@app.post("/webhook")
+async def tradingview_webhook(request: Request):
+    try:
+        data = await request.json()
+        raw_ticker = data.get("ticker", "UNKNOWN")
+        ticker = str(raw_ticker).upper().replace(".P", "").replace("PERP", "").strip()
+        
+        raw_action = str(data.get("action", "")).lower().strip() # "buy" або "sell"
+        price = float(data.get("price", 0.0))
+        
+        # Читаємо стан ринку з ключа "strategy" (ваш JSON з TV) або "market_position"
+        market_pos = str(data.get("strategy") or data.get("market_position") or "").lower().strip()
+        comment = str(data.get("comment", "")).lower().strip()
+
+        # Визначаємо, чи це сигнал на закриття (flat)
+        is_close_signal = (
+            market_pos == "flat"
+            or "close" in raw_action
+            or "exit" in raw_action
+            or "close" in comment
+            or "exit" in comment
+        )
+
+        now = datetime.now(timezone.utc)
+        now_str = now.strftime('%Y-%m-%d %H:%M UTC')
+        roi_text = ""
+
+        # --- ЗАКРИТТЯ ПОЗИЦІЇ ---
+        if is_close_signal:
+            active_trade = await get_active_trade(ticker)
+            
+            if active_trade:
+                entry_price, saved_direction, _ = active_trade
+                
+                # Напрямок і ROI розраховуються ЗА ЗБЕРЕЖЕНИМ ВХОДОМ з БД
+                if "long" in saved_direction or "buy" in saved_direction:
+                    action_label = "🔒 CLOSE LONG POSITION"
+                    roi = ((price - entry_price) / entry_price) * 100
+                else:
+                    action_label = "🔒 CLOSE SHORT POSITION"
+                    roi = ((entry_price - price) / entry_price) * 100
+
+                price_block = f"💵 **Entry Price:** {entry_price}\n💵 **Close Price:** {price}"
+                roi_emoji = "📈" if roi >= 0 else "📉"
+                roi_text = f"{roi_emoji} **ROI:** `{roi:+.2f}%`\n"
+
+                await delete_active_trade(ticker)
+            else:
+                action_label = "🔒 CLOSE POSITION"
+                price_block = f"💵 **Close Price:** {price}"
+                roi_text = "⚠️ *Ціну входу в базі не знайдено*\n"
+
+            db_action = "close"
+
+        # --- ВХІД У ПОЗИЦІЮ ---
+        else:
+            if market_pos == "long" or "buy" in raw_action:
+                action_label = "🟢 BUY / LONG"
+                db_action = "buy"
+                direction_type = "long"
+            elif market_pos == "short" or "sell" in raw_action:
+                action_label = "🔴 SELL / SHORT"
+                db_action = "sell"
+                direction_type = "short"
+            else:
+                action_label = raw_action.upper()
+                db_action = raw_action
+                direction_type = raw_action
+
+            await save_active_trade(ticker, price, direction_type, now_str)
+            price_block = f"💵 **Entry Price:** {price}"
+
+        # 1. Запис в історію
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO trades (ticker, action, price, timestamp) VALUES (?, ?, ?, ?)",
+                (ticker, db_action, price, now.isoformat())
+            )
+            await db.commit()
+
+        # 2. Сповіщення в Telegram
+        if TELEGRAM_CHANNEL_ID and bot:
+            signal_text = (
+                f"⚡ **KERDOS SIGNAL** ⚡\n\n"
+                f"🪙 **Coin:** #{ticker}\n"
+                f"🎯 **Action:** {action_label}\n"
+                f"{price_block}\n"
+                f"{roi_text}"
+                f"⏰ **Time:** {now_str}"
+            )
+            await bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=signal_text, parse_mode="Markdown")
+
+        return {"status": "ok"}
+
+    except Exception as e:
+        logger.error(f"Error processing TradingView webhook: {e}")
+        return {"status": "error", "message": str(e)}
