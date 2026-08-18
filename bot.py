@@ -17,17 +17,14 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")  # ID VIP-групи або каналу
 ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))  # ID адміна
 
-# 🔗 Посилання на загальну групу спілкування
 PUBLIC_CHAT_LINK = os.getenv("PUBLIC_CHAT_LINK", "https://t.me/kerdos_group")
 
 DB_PATH = "trades.db"
 
-# ⬇️ РЕКВІЗИТИ КРИПТОГАМАНЦІВ BINANCE ⬇️
 WALLET_USDT_TRC20 = "THeVYP6zqgJ3jKMhNAuBxqGk47iFno6pKL"
 WALLET_USDT_BEP20 = "0x97eb6c4c2fe24798ccf24ed5d52cb228f32f5f5f"
 WALLET_USDT_SOLANA = "5Pcc4WUfA1qBas6P42WDYRre8ugAenNe5UsN6c2DyUox"
 
-# 🪙 Список монет, доступних для підключення до Signal Bot
 AVAILABLE_COINS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "HYPEUSDT", "LINKUSDT",
     "ONDOUSDT", "JTOUSDT", "LTCUSDT", "APTUSDT", "DOTUSDT",
@@ -37,14 +34,10 @@ AVAILABLE_COINS = [
 ]
 
 bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
-
-# Кешований username бота
 BOT_USERNAME = None
 
 
-# --- ЕКРАНУВАННЯ MARKDOWN ---
 def escape_md(text) -> str:
-    """Екранує спецсимволи застарілого Telegram Markdown (V1): _ * ` ["""
     if text is None:
         return ""
     text = str(text)
@@ -53,7 +46,6 @@ def escape_md(text) -> str:
     return text
 
 
-# --- LIFESPAN ЗАМІСТЬ on_event ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global BOT_USERNAME
@@ -156,7 +148,7 @@ async def get_awaiting_support(user_id: int) -> int:
     return 0
 
 
-# --- ФОНОВИЙ ТАЙМЕР ЗВІЛЬНЕННЯ ТРИАЛУ ТА ПІДПИСКИ ---
+# --- ФОНОВИЙ ТАЙМЕР ---
 
 async def check_expired_trials():
     while True:
@@ -165,7 +157,6 @@ async def check_expired_trials():
             now = datetime.now(timezone.utc)
 
             async with aiosqlite.connect(DB_PATH) as db:
-                # 1. Завершення триалу
                 async with db.execute(
                     "SELECT user_id, username, lang FROM users WHERE status = 'trial' AND trial_end <= ?",
                     (now.isoformat(),)
@@ -201,7 +192,6 @@ async def check_expired_trials():
                     except Exception as e:
                         logger.error(f"Failed to remove expired user {user_id}: {e}")
 
-                # 2. Завершення платної підписки на VIP-групу
                 async with db.execute(
                     "SELECT user_id, username, lang FROM users WHERE status = 'active' AND sub_end <= ?",
                     (now.isoformat(),)
@@ -233,7 +223,6 @@ async def check_expired_trials():
                     except Exception as e:
                         logger.error(f"Failed to remove expired sub user {user_id}: {e}")
 
-                # 3. Завершення платної підписки на Signal Bot
                 async with db.execute(
                     "SELECT user_id, username, lang, selected_coin, signal_token FROM users WHERE bot_sub_end IS NOT NULL AND bot_sub_end <= ?",
                     (now.isoformat(),)
@@ -325,7 +314,6 @@ def get_cancel_support_keyboard(lang="ua"):
 
 
 def get_coin_selection_keyboard():
-    """Клавіатура вибору монети для Signal Bot."""
     rows = []
     row = []
     for ticker in AVAILABLE_COINS:
@@ -663,7 +651,7 @@ async def forward_token_to_admin(user_id: int, username: str, token: str):
         f"👤 **Користувач:** {user_disp}\n"
         f"🆔 **ID:** `{user_id}`\n"
         f"🪙 **Обрана монета:** `{selected_coin}`\n\n"
-        "📋 **Token:**\n`{escape_md(token)}`"
+        f"📋 **Token:**\n`{escape_md(token)}`"
     )
 
     try:
@@ -846,13 +834,18 @@ async def telegram_webhook(request: Request):
                         await bot.send_message(chat_id=chat_id, text="Формат: `/give_bot 123456789`", parse_mode="Markdown")
                     return {"status": "ok"}
 
-            # ОБРОБКА ЗВЕРНЕННЯ В ПІДТРИМКУ
+            # ОБРОБКА ЗВЕРНЕННЯ В ПІДТРИМКУ (ВИПРАВЛЕНО ТУТ)
             if is_awaiting_support == 1 and ADMIN_TELEGRAM_ID and user_id != ADMIN_TELEGRAM_ID:
                 await set_awaiting_support(user_id, 0)
 
-                admin_keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("💬 Ввійти в чат / Відповісти", url=f"tg://user?id={user_id}")]
-                ])
+                # Замість tg://user?id= використовуємо посилання на username якщо він є, або callback_data
+                if username and username != "no_username":
+                    user_link = f"https://t.me/{username}"
+                    admin_keyboard = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("💬 Написати користувачу", url=user_link)]
+                    ])
+                else:
+                    admin_keyboard = None
 
                 safe_username = escape_md(username)
                 support_header = f"🛟 **НОВЕ ЗВЕРНЕННЯ В ПІДТРИМКУ!**\n\n👤 **Від:** @{safe_username}\n🆔 **ID:** `{user_id}`\n🌐 **Мова:** {user_lang.upper()}\n"
@@ -1037,7 +1030,6 @@ async def telegram_webhook(request: Request):
                         text = "📊 База користувачів порожня."
                     else:
                         text = "📊 *Останні користувачі:*\n\n"
-                        now_utc = datetime.now(timezone.utc)
 
                         for u_id, u_name, u_status, t_end, s_end, b_end in users:
                             u_name_disp = f"@{escape_md(u_name)}" if u_name and u_name != "no_username" else f"ID: `{u_id}`"
