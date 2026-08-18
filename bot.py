@@ -737,7 +737,7 @@ def get_admin_panel_keyboard():
 
         [
             InlineKeyboardButton(
-                "📈 Оновити ROI монет",
+                "📈 Переглянути ROI монет",
                 callback_data="admin_roi_info"
             )
         ],
@@ -1790,6 +1790,21 @@ async def handle_message(update: Update):
 
         return
 
+    # FALLBACK — незрозуміле повідомлення
+
+    lang = await get_user_lang(
+        user.id
+    )
+
+    await update.message.reply_text(
+
+        get_text_start(lang),
+
+        reply_markup=get_main_keyboard(lang),
+
+        parse_mode="Markdown"
+    )
+
 
 # =======================================================
 # CALLBACKS
@@ -2297,70 +2312,6 @@ async def process_update(update: Update):
 
 
 # =======================================================
-# TELEGRAM WEBHOOK
-# =======================================================
-
-@app.post("/webhook")
-async def telegram_webhook(
-    request: Request
-):
-
-    try:
-
-        data = await request.json()
-
-        update = Update.de_json(
-            data,
-            bot
-        )
-
-        await process_update(
-            update
-        )
-
-        return {
-            "ok": True
-        }
-
-    except Exception as e:
-
-        logger.exception(
-            f"Webhook error: {e}"
-        )
-
-        return {
-            "ok": False,
-            "error": str(e)
-        }
-
-
-# =======================================================
-# HEALTH CHECK
-# =======================================================
-
-@app.get("/")
-async def root():
-
-    return {
-        "status": "live",
-        "telegram_bot": bool(bot),
-        "webhook_url": (
-            f"{RENDER_EXTERNAL_URL}/webhook"
-            if RENDER_EXTERNAL_URL
-            else None
-        )
-    }
-
-
-@app.get("/health")
-async def health():
-
-    return {
-        "status": "ok"
-    }
-
-
-# =======================================================
 # EXPIRED SUBSCRIPTIONS
 # =======================================================
 
@@ -2369,8 +2320,6 @@ async def check_expired_trials():
     while True:
 
         try:
-
-            await asyncio.sleep(3600)
 
             now = datetime.now(timezone.utc)
 
@@ -2632,6 +2581,8 @@ async def check_expired_trials():
                 f"Expiration loop error: {e}"
             )
 
+        await asyncio.sleep(3600)
+
 
 # =======================================================
 # LIFESPAN
@@ -2747,3 +2698,67 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     lifespan=lifespan
 )
+# =======================================================
+# TELEGRAM WEBHOOK
+# =======================================================
+
+@app.post("/webhook")
+async def telegram_webhook(
+    request: Request
+):
+
+    try:
+
+        data = await request.json()
+
+        update = Update.de_json(
+            data,
+            bot
+        )
+
+        await process_update(
+            update
+        )
+
+        return {
+            "ok": True
+        }
+
+    except Exception as e:
+
+        logger.exception(
+            f"Webhook error: {e}"
+        )
+
+        return {
+            "ok": False,
+            "error": str(e)
+        }
+
+
+# =======================================================
+# HEALTH CHECK
+# =======================================================
+
+@app.get("/")
+async def root():
+
+    return {
+        "status": "live",
+        "telegram_bot": bool(bot),
+        "webhook_url": (
+            f"{RENDER_EXTERNAL_URL}/webhook"
+            if RENDER_EXTERNAL_URL
+            else None
+        )
+    }
+
+
+@app.get("/health")
+async def health():
+
+    return {
+        "status": "ok"
+    }
+
+
