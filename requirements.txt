@@ -1,4 +1,5 @@
-aiogram
-aiohttp
-apscheduler
+fastapi
+uvicorn
+python-telegram-bot
 aiosqlite
+
