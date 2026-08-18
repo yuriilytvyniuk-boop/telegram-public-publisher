@@ -470,7 +470,7 @@ def get_text_start(lang="ua"):
     if lang == "ua":
         return (
             "👋 **Вітаємо у спільноті Kerdos!**\n\n"
-            "Я — **Mireya**, ваш персональний помічник аналітичної торгової системи **Kerdos**.\n\n"
+            "Я — **Corvin**, ваш персональний помічник аналітичної торгової системи **Kerdos**.\n\n"
             "🎁 **Спеціальні пропозиції та Бонуси:**\n"
             "• 🚀 **14 днів FREE-доступу:** Кожен новий користувач отримує 2 тижні безкоштовного тестового доступу до VIP-групи Kerdos!\n"
             "• 👥 **Реферальна програма «Приведи друга»:** За кожного друга, який візьме безкоштовний пробний період — отримуй **+14 днів безкоштовного доступу**!\n\n"
@@ -490,7 +490,7 @@ def get_text_start(lang="ua"):
         )
     return (
         "👋 **Welcome to the Kerdos community!**\n\n"
-        "I am **Mireya**, your personal assistant for the **Kerdos** trading system.\n\n"
+        "I am **Corvin**, your personal assistant for the **Kerdos** trading system.\n\n"
         "🎁 **Special Offers & Bonuses:**\n"
         "• 🚀 **14-Day FREE Trial:** Every new user gets 2 weeks of free trial access to our Kerdos VIP Signals Group!\n"
         "• 👥 **\"Refer a Friend\" Program:** Bring a friend, and once they claim their free trial, get **+14 days of free VIP access**!\n\n"
@@ -516,14 +516,14 @@ def get_text_support_prompt(lang="ua"):
             "Ви виявили помилку, маєте запитання щодо підписки або потребуєте допомоги з налаштуванням?\n\n"
             "📝 **Будь ласка, опишіть вашу проблему нижче в одному повідомленні:**\n"
             "*(Ви також можете додати скріншот або фото помилки)*\n\n"
-            "⏳ *Mireya одразу ж передасть ваше звернення адміністратору!*"
+            "⏳ *Corvin одразу ж передасть ваше звернення адміністратору!*"
         )
     return (
         "🛟 **KERDOS SUPPORT HELPDESK**\n\n"
         "Did you encounter an issue, have questions about your subscription, or need setup assistance?\n\n"
         "📝 **Please describe your issue below in a single message:**\n"
         "*(You can also attach a screenshot or photo)*\n\n"
-        "⏳ *Mireya will forward your ticket directly to the administrator!*"
+        "⏳ *Corvin will forward your ticket directly to the administrator!*"
     )
 
 def get_text_vip_payment(lang="ua"):
@@ -537,7 +537,7 @@ def get_text_vip_payment(lang="ua"):
             "*(Натисніть на адресу, щоб її скопіювати)*\n\n"
             "📥 **ПІДТВЕРДЖЕННЯ ОПЛАТИ:**\n"
             "Після виконання переказу **надішліть квитанцію (фото, скріншот або текст з хешем транзакції) сюди в чат**.\n\n"
-            "Я (Mireya) передам її адміністратору на перевірку, і доступ буде надано!"
+            "Я (Corvin) передам її адміністратору на перевірку, і доступ буде надано!"
         )
     return (
         "💳 **Kerdos VIP Group Subscription ($20 / 30 days)**\n\n"
@@ -548,7 +548,7 @@ def get_text_vip_payment(lang="ua"):
         "*(Tap the address to copy it)*\n\n"
         "📥 **HOW TO CONFIRM PAYMENT:**\n"
         "After completing the transfer, **send the receipt (photo, screenshot, or transaction TxID) directly into this chat**.\n\n"
-        "I (Mireya) will forward it to the admin for verification!"
+        "I (Corvin) will forward it to the admin for verification!"
     )
 
 def get_text_bot_payment(lang="ua"):
