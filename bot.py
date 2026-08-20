@@ -7,7 +7,7 @@ from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request
 import telegram
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-import aiosqlite
+import asyncpg
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,7 +20,20 @@ ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))  # ID адміна
 # 🔗 Посилання на загальну групу спілкування
 PUBLIC_CHAT_LINK = os.getenv("PUBLIC_CHAT_LINK", "https://t.me/kerdos_group")
 
-DB_PATH = "trades.db"
+# =======================================================
+# БАЗА ДАНИХ: PostgreSQL (Render) через asyncpg
+# =======================================================
+# Render автоматично створює змінну DATABASE_URL, коли ви додаєте
+# PostgreSQL-базу до сервісу. Якщо бот і база знаходяться в одному
+# регіоні Render, використовуйте "Internal Database URL" — тоді
+# DB_SSL можна лишити вимкненим (за замовчуванням). Якщо підключаєтесь
+# ззовні (External Database URL) або з іншого хостингу, встановіть
+# змінну середовища DB_SSL=true.
+DATABASE_URL = os.getenv("DATABASE_URL")
+DB_SSL = os.getenv("DB_SSL", "false").lower() == "true"
+
+# Пул з'єднань asyncpg. Ініціалізується у lifespan() при старті додатку.
+db_pool: asyncpg.Pool | None = None
 
 # ⬇️ РЕКВІЗИТИ КРИПТОГАМАНЦІВ BINANCE ⬇️
 WALLET_USDT_TRC20 = "THeVYP6zqgJ3jKMhNAuBxqGk47iFno6pKL"
@@ -69,8 +82,21 @@ def escape_md(text) -> str:
 # =======================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global BOT_USERNAME
-    await init_db()
+    global BOT_USERNAME, db_pool
+
+    if not DATABASE_URL:
+        logger.error(
+            "DATABASE_URL не встановлено! Додайте PostgreSQL-базу на Render "
+            "і переконайтеся, що змінна середовища DATABASE_URL передана сервісу."
+        )
+    else:
+        db_pool = await asyncpg.create_pool(
+            dsn=DATABASE_URL,
+            ssl="require" if DB_SSL else None,
+            min_size=1,
+            max_size=10,
+        )
+        await init_db()
 
     if bot:
         try:
@@ -88,38 +114,40 @@ async def lifespan(app: FastAPI):
             await bg_task
         except asyncio.CancelledError:
             pass
+        if db_pool:
+            await db_pool.close()
 
 
 app = FastAPI(lifespan=lifespan)
 # =======================================================
 
-# --- БАЗА ДАНИХ ---
+# --- БАЗА ДАНИХ (PostgreSQL / asyncpg) ---
 
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_pool.acquire() as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id BIGSERIAL PRIMARY KEY,
                 ticker TEXT,
                 action TEXT,
-                price REAL,
-                roi REAL,
-                timestamp DATETIME
+                price DOUBLE PRECISION,
+                roi DOUBLE PRECISION,
+                timestamp TIMESTAMPTZ
             )
         """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
+                user_id BIGINT PRIMARY KEY,
                 username TEXT,
                 trial_used INTEGER DEFAULT 0,
-                trial_start DATETIME,
-                trial_end DATETIME,
-                sub_end DATETIME,
-                bot_sub_end DATETIME,
+                trial_start TIMESTAMPTZ,
+                trial_end TIMESTAMPTZ,
+                sub_end TIMESTAMPTZ,
+                bot_sub_end TIMESTAMPTZ,
                 signal_token TEXT,
                 status TEXT DEFAULT 'free',
                 lang TEXT DEFAULT 'ua',
-                referrer_id INTEGER DEFAULT NULL,
+                referrer_id BIGINT DEFAULT NULL,
                 awaiting_support INTEGER DEFAULT 0,
                 selected_coin TEXT
             )
@@ -127,116 +155,106 @@ async def init_db():
         await db.execute("""
             CREATE TABLE IF NOT EXISTS coin_roi (
                 ticker TEXT PRIMARY KEY,
-                roi REAL,
-                updated_at DATETIME
+                roi DOUBLE PRECISION,
+                updated_at TIMESTAMPTZ
             )
         """)
         await db.execute("""
-        CREATE TABLE IF NOT EXISTS active_trades (
-            symbol TEXT PRIMARY KEY,
-            entry_price REAL,
-            direction TEXT,
-            time TEXT
-        )
-    """)
-        # Міграція: додаємо selected_coin, якщо БД була створена до цього оновлення
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN selected_coin TEXT")
-        except Exception:
-            pass  # колонка вже існує
-        await db.commit()
+            CREATE TABLE IF NOT EXISTS active_trades (
+                symbol TEXT PRIMARY KEY,
+                entry_price DOUBLE PRECISION,
+                direction TEXT,
+                time TEXT
+            )
+        """)
+        # Міграція: додаємо selected_coin, якщо таблиця users була створена
+        # до появи цієї колонки. IF NOT EXISTS робить це безпечним при кожному старті.
+        await db.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS selected_coin TEXT")
 
 
 async def get_coin_roi(ticker: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT roi, updated_at FROM coin_roi WHERE ticker = ?", (ticker,)) as cursor:
-            row = await cursor.fetchone()
-            if row and row[0] is not None:
-                return row[0]
+    async with db_pool.acquire() as db:
+        row = await db.fetchrow("SELECT roi, updated_at FROM coin_roi WHERE ticker = $1", ticker)
+        if row and row["roi"] is not None:
+            return row["roi"]
     return None
 
 async def save_active_trade(symbol: str, entry_price: float, direction: str, time_str: str):
     """Зберігає або оновлює інформацію про відкриту позицію монети."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('''
-            INSERT OR REPLACE INTO active_trades (symbol, entry_price, direction, time)
-            VALUES (?, ?, ?, ?)
-        ''', (symbol, entry_price, direction, time_str))
-        await db.commit()
+    async with db_pool.acquire() as db:
+        await db.execute("""
+            INSERT INTO active_trades (symbol, entry_price, direction, time)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (symbol) DO UPDATE SET
+                entry_price = excluded.entry_price,
+                direction = excluded.direction,
+                time = excluded.time
+        """, symbol, entry_price, direction, time_str)
 
 async def get_active_trade(symbol: str):
     """Отримує відкриту позицію для конкретної монети."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT entry_price, direction, time FROM active_trades WHERE symbol = ?', (symbol,)) as cursor:
-            row = await cursor.fetchone()
-            return row
+    async with db_pool.acquire() as db:
+        row = await db.fetchrow('SELECT entry_price, direction, time FROM active_trades WHERE symbol = $1', symbol)
+        return tuple(row) if row else None
 
 async def delete_active_trade(symbol: str):
     """Видаляє позицію з активних після її закриття."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('DELETE FROM active_trades WHERE symbol = ?', (symbol,))
-        await db.commit()
+    async with db_pool.acquire() as db:
+        await db.execute('DELETE FROM active_trades WHERE symbol = $1', symbol)
 
 async def get_all_coin_roi() -> dict:
     result = {}
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT ticker, roi FROM coin_roi") as cursor:
-            rows = await cursor.fetchall()
-            for ticker, roi in rows:
-                result[ticker] = roi
+    async with db_pool.acquire() as db:
+        rows = await db.fetch("SELECT ticker, roi FROM coin_roi")
+        for row in rows:
+            result[row["ticker"]] = row["roi"]
     return result
 
 async def set_coin_roi(ticker: str, roi: float):
     now = datetime.now(timezone.utc)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_pool.acquire() as db:
         await db.execute("""
             INSERT INTO coin_roi (ticker, roi, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(ticker) DO UPDATE SET roi = excluded.roi, updated_at = excluded.updated_at
-        """, (ticker, roi, now.isoformat()))
-        await db.commit()
+            VALUES ($1, $2, $3)
+            ON CONFLICT (ticker) DO UPDATE SET roi = excluded.roi, updated_at = excluded.updated_at
+        """, ticker, roi, now)
 
 async def set_user_selected_coin(user_id: int, ticker: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_pool.acquire() as db:
         await db.execute("""
             INSERT INTO users (user_id, selected_coin)
-            VALUES (?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET selected_coin = excluded.selected_coin
-        """, (user_id, ticker))
-        await db.commit()
+            VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET selected_coin = excluded.selected_coin
+        """, user_id, ticker)
 
 async def get_user_lang(user_id: int) -> str:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT lang FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            if row and row[0]:
-                return row[0]
+    async with db_pool.acquire() as db:
+        row = await db.fetchrow("SELECT lang FROM users WHERE user_id = $1", user_id)
+        if row and row["lang"]:
+            return row["lang"]
     return "ua"
 
 async def set_user_lang(user_id: int, lang: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_pool.acquire() as db:
         await db.execute("""
             INSERT INTO users (user_id, lang)
-            VALUES (?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET lang = excluded.lang
-        """, (user_id, lang))
-        await db.commit()
+            VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET lang = excluded.lang
+        """, user_id, lang)
 
 async def set_awaiting_support(user_id: int, state: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_pool.acquire() as db:
         await db.execute("""
             INSERT INTO users (user_id, awaiting_support)
-            VALUES (?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET awaiting_support = excluded.awaiting_support
-        """, (user_id, state))
-        await db.commit()
+            VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET awaiting_support = excluded.awaiting_support
+        """, user_id, state)
 
 async def get_awaiting_support(user_id: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT awaiting_support FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            if row and row[0] is not None:
-                return row[0]
+    async with db_pool.acquire() as db:
+        row = await db.fetchrow("SELECT awaiting_support FROM users WHERE user_id = $1", user_id)
+        if row and row["awaiting_support"] is not None:
+            return row["awaiting_support"]
     return 0
 
 # --- ФОНОВИЙ ТАЙМЕР ЗВІЛЬНЕННЯ ТРИАЛУ ТА ПІДПИСКИ ---
@@ -247,13 +265,12 @@ async def check_expired_trials():
             await asyncio.sleep(3600)
             now = datetime.now(timezone.utc)
 
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with db_pool.acquire() as db:
                 # 1. Завершення триалу (14 днів)
-                async with db.execute(
-                    "SELECT user_id, username, lang FROM users WHERE status = 'trial' AND trial_end <= ?",
-                    (now.isoformat(),)
-                ) as cursor:
-                    expired_trials = await cursor.fetchall()
+                expired_trials = await db.fetch(
+                    "SELECT user_id, username, lang FROM users WHERE status = 'trial' AND trial_end <= $1",
+                    now
+                )
 
                 for user_id, username, lang in expired_trials:
                     try:
@@ -261,8 +278,7 @@ async def check_expired_trials():
                             await bot.ban_chat_member(chat_id=TELEGRAM_CHANNEL_ID, user_id=user_id)
                             await bot.unban_chat_member(chat_id=TELEGRAM_CHANNEL_ID, user_id=user_id)
 
-                        await db.execute("UPDATE users SET status = 'expired' WHERE user_id = ?", (user_id,))
-                        await db.commit()
+                        await db.execute("UPDATE users SET status = 'expired' WHERE user_id = $1", user_id)
 
                         user_lang = lang or "ua"
                         text = (
@@ -285,11 +301,10 @@ async def check_expired_trials():
                         logger.error(f"Failed to remove expired user {user_id}: {e}")
 
                 # 2. Завершення платній підписки на VIP-групу
-                async with db.execute(
-                    "SELECT user_id, username, lang FROM users WHERE status = 'active' AND sub_end <= ?",
-                    (now.isoformat(),)
-                ) as cursor:
-                    expired_subs = await cursor.fetchall()
+                expired_subs = await db.fetch(
+                    "SELECT user_id, username, lang FROM users WHERE status = 'active' AND sub_end <= $1",
+                    now
+                )
 
                 for user_id, username, lang in expired_subs:
                     try:
@@ -297,8 +312,7 @@ async def check_expired_trials():
                             await bot.ban_chat_member(chat_id=TELEGRAM_CHANNEL_ID, user_id=user_id)
                             await bot.unban_chat_member(chat_id=TELEGRAM_CHANNEL_ID, user_id=user_id)
 
-                        await db.execute("UPDATE users SET status = 'expired' WHERE user_id = ?", (user_id,))
-                        await db.commit()
+                        await db.execute("UPDATE users SET status = 'expired' WHERE user_id = $1", user_id)
 
                         user_lang = lang or "ua"
                         text = (
@@ -323,16 +337,14 @@ async def check_expired_trials():
                 # OKX-токен більше не пересилається автоматично — тому це
                 # сповіщення також є для адміна нагадуванням прибрати токен
                 # користувача зі сповіщень (Alert Message) TradingView.
-                async with db.execute(
-                    "SELECT user_id, username, lang, selected_coin, signal_token FROM users WHERE bot_sub_end IS NOT NULL AND bot_sub_end <= ?",
-                    (now.isoformat(),)
-                ) as cursor:
-                    expired_bots = await cursor.fetchall()
+                expired_bots = await db.fetch(
+                    "SELECT user_id, username, lang, selected_coin, signal_token FROM users WHERE bot_sub_end IS NOT NULL AND bot_sub_end <= $1",
+                    now
+                )
 
                 for user_id, username, lang, selected_coin, signal_token in expired_bots:
                     try:
-                        await db.execute("UPDATE users SET bot_sub_end = NULL WHERE user_id = ?", (user_id,))
-                        await db.commit()
+                        await db.execute("UPDATE users SET bot_sub_end = NULL WHERE user_id = $1", user_id)
 
                         user_lang = lang or "ua"
                         user_text = (
@@ -431,6 +443,9 @@ async def get_coin_selection_keyboard(lang="ua"):
             row = []
     if row:
         rows.append(row)
+    rows.append([
+        InlineKeyboardButton("🔙 Назад" if lang == "ua" else "🔙 Back", callback_data="btn_back_main")
+    ])
     return InlineKeyboardMarkup(rows)
 
 # =======================================================
@@ -441,17 +456,22 @@ def get_admin_panel_keyboard():
         [InlineKeyboardButton("👥 Список підключених людей", callback_data="admin_users_list")],
         [InlineKeyboardButton("👑 Надати VIP", callback_data="admin_grant_vip")],
         [InlineKeyboardButton("🤖 Надати доступ до бота", callback_data="admin_grant_bot")],
-        [InlineKeyboardButton("📈 Оновити ROI монет", callback_data="admin_roi_info")]
+        [InlineKeyboardButton("📈 Оновити ROI монет", callback_data="admin_roi_info")],
+        [InlineKeyboardButton("🔙 Закрити", callback_data="btn_back_main")]
     ])
 # =======================================================
 
 # =======================================================
 # БЛОК ДОДАНОГО ФУНКЦІОНАЛУ: ПІДРАХУНОК ДНІВ, ЩО ЗАЛИШИЛИСЬ
 # =======================================================
-def calc_days_left(end_iso: str) -> int:
-    """Повертає кількість повних днів, що залишились до end_iso (0, якщо термін минув)."""
+def calc_days_left(end_dt) -> int:
+    """Повертає кількість повних днів, що залишились до end_dt (0, якщо термін минув).
+
+    Приймає datetime (як повертає asyncpg для колонок TIMESTAMPTZ) або
+    ISO-рядок (для зворотної сумісності)."""
     try:
-        end_dt = datetime.fromisoformat(end_iso)
+        if isinstance(end_dt, str):
+            end_dt = datetime.fromisoformat(end_dt)
         if end_dt.tzinfo is None:
             end_dt = end_dt.replace(tzinfo=timezone.utc)
         now = datetime.now(timezone.utc)
@@ -470,7 +490,7 @@ def get_text_start(lang="ua"):
     if lang == "ua":
         return (
             "👋 **Вітаємо у спільноті Kerdos!**\n\n"
-            "Я — **Corvin**, ваш персональний помічник аналітичної торгової системи **Kerdos**.\n\n"
+            "Я — **Mireya**, ваш персональний помічник аналітичної торгової системи **Kerdos**.\n\n"
             "🎁 **Спеціальні пропозиції та Бонуси:**\n"
             "• 🚀 **14 днів FREE-доступу:** Кожен новий користувач отримує 2 тижні безкоштовного тестового доступу до VIP-групи Kerdos!\n"
             "• 👥 **Реферальна програма «Приведи друга»:** За кожного друга, який візьме безкоштовний пробний період — отримуй **+14 днів безкоштовного доступу**!\n\n"
@@ -490,7 +510,7 @@ def get_text_start(lang="ua"):
         )
     return (
         "👋 **Welcome to the Kerdos community!**\n\n"
-        "I am **Corvin**, your personal assistant for the **Kerdos** trading system.\n\n"
+        "I am **Mireya**, your personal assistant for the **Kerdos** trading system.\n\n"
         "🎁 **Special Offers & Bonuses:**\n"
         "• 🚀 **14-Day FREE Trial:** Every new user gets 2 weeks of free trial access to our Kerdos VIP Signals Group!\n"
         "• 👥 **\"Refer a Friend\" Program:** Bring a friend, and once they claim their free trial, get **+14 days of free VIP access**!\n\n"
@@ -516,14 +536,14 @@ def get_text_support_prompt(lang="ua"):
             "Ви виявили помилку, маєте запитання щодо підписки або потребуєте допомоги з налаштуванням?\n\n"
             "📝 **Будь ласка, опишіть вашу проблему нижче в одному повідомленні:**\n"
             "*(Ви також можете додати скріншот або фото помилки)*\n\n"
-            "⏳ *Corvin одразу ж передасть ваше звернення адміністратору!*"
+            "⏳ *Mireya одразу ж передасть ваше звернення адміністратору!*"
         )
     return (
         "🛟 **KERDOS SUPPORT HELPDESK**\n\n"
         "Did you encounter an issue, have questions about your subscription, or need setup assistance?\n\n"
         "📝 **Please describe your issue below in a single message:**\n"
         "*(You can also attach a screenshot or photo)*\n\n"
-        "⏳ *Corvin will forward your ticket directly to the administrator!*"
+        "⏳ *Mireya will forward your ticket directly to the administrator!*"
     )
 
 def get_text_vip_payment(lang="ua"):
@@ -537,7 +557,7 @@ def get_text_vip_payment(lang="ua"):
             "*(Натисніть на адресу, щоб її скопіювати)*\n\n"
             "📥 **ПІДТВЕРДЖЕННЯ ОПЛАТИ:**\n"
             "Після виконання переказу **надішліть квитанцію (фото, скріншот або текст з хешем транзакції) сюди в чат**.\n\n"
-            "Я (Corvin) передам її адміністратору на перевірку, і доступ буде надано!"
+            "Я (Mireya) передам її адміністратору на перевірку, і доступ буде надано!"
         )
     return (
         "💳 **Kerdos VIP Group Subscription ($20 / 30 days)**\n\n"
@@ -548,7 +568,7 @@ def get_text_vip_payment(lang="ua"):
         "*(Tap the address to copy it)*\n\n"
         "📥 **HOW TO CONFIRM PAYMENT:**\n"
         "After completing the transfer, **send the receipt (photo, screenshot, or transaction TxID) directly into this chat**.\n\n"
-        "I (Corvin) will forward it to the admin for verification!"
+        "I (Mireya) will forward it to the admin for verification!"
     )
 
 def get_text_bot_payment(lang="ua"):
@@ -694,10 +714,10 @@ def get_text_token_invalid(lang="ua"):
 async def get_referral_text(user_id: int, bot_username: str, lang: str = "ua") -> str:
     ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*) FROM users WHERE referrer_id = ? AND trial_used = 1", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            active_refs = row[0] if row else 0
+    async with db_pool.acquire() as db:
+        active_refs = await db.fetchval(
+            "SELECT COUNT(*) FROM users WHERE referrer_id = $1 AND trial_used = 1", user_id
+        )
 
     if lang == "ua":
         return (
@@ -719,16 +739,15 @@ async def handle_free_trial_request(user_id: int, username: str, lang: str = "ua
     now = datetime.now(timezone.utc)
     trial_end = now + timedelta(days=14)
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT trial_used, referrer_id FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            user = await cursor.fetchone()
+    async with db_pool.acquire() as db:
+        user = await db.fetchrow("SELECT trial_used, referrer_id FROM users WHERE user_id = $1", user_id)
 
-        if user and user[0] == 1:
+        if user and user["trial_used"] == 1:
             if lang == "ua":
                 return "⚠️ **Ви вже використовували безкоштовний 14-денний період.**\n\nВи можете оформити підписку у головному меню."
             return "⚠️ **You have already used your 14-day free trial.**\n\nYou can subscribe in the main menu."
 
-        referrer_id = user[1] if user else None
+        referrer_id = user["referrer_id"] if user else None
 
         try:
             if not TELEGRAM_CHANNEL_ID:
@@ -742,43 +761,30 @@ async def handle_free_trial_request(user_id: int, username: str, lang: str = "ua
 
             await db.execute("""
                 INSERT INTO users (user_id, username, trial_used, trial_start, trial_end, status, lang)
-                VALUES (?, ?, 1, ?, ?, 'trial', ?)
-                ON CONFLICT(user_id) DO UPDATE SET
+                VALUES ($1, $2, 1, $3, $4, 'trial', $5)
+                ON CONFLICT (user_id) DO UPDATE SET
                     trial_used = 1,
                     trial_start = excluded.trial_start,
                     trial_end = excluded.trial_end,
                     status = 'trial'
-            """, (user_id, username, now.isoformat(), trial_end.isoformat(), lang))
-            await db.commit()
+            """, user_id, username, now, trial_end, lang)
 
             # --- АВТОМАТИЧНЕ НАРАХУВАННЯ БОНУСУ ЗАПРОШУЮЧОМУ ---
             if referrer_id:
-                async with db.execute("SELECT trial_end, sub_end, status, lang FROM users WHERE user_id = ?", (referrer_id,)) as cursor:
-                    ref_user = await cursor.fetchone()
+                ref_user = await db.fetchrow("SELECT trial_end, sub_end, status, lang FROM users WHERE user_id = $1", referrer_id)
 
                 if ref_user:
-                    ref_trial_end, ref_sub_end, ref_status, ref_lang = ref_user
+                    ref_trial_end, ref_sub_end, ref_status, ref_lang = ref_user["trial_end"], ref_user["sub_end"], ref_user["status"], ref_user["lang"]
                     ref_lang = ref_lang or "ua"
 
                     if ref_status == 'active' and ref_sub_end:
-                        curr_end = datetime.fromisoformat(ref_sub_end)
-                        if curr_end.tzinfo is None:
-                            curr_end = curr_end.replace(tzinfo=timezone.utc)
-                        base_time = max(now, curr_end)
+                        base_time = max(now, ref_sub_end)
                         new_end = base_time + timedelta(days=14)
-                        await db.execute("UPDATE users SET sub_end = ? WHERE user_id = ?", (new_end.isoformat(), referrer_id))
+                        await db.execute("UPDATE users SET sub_end = $1 WHERE user_id = $2", new_end, referrer_id)
                     else:
-                        curr_end = None
-                        if ref_trial_end:
-                            curr_end = datetime.fromisoformat(ref_trial_end)
-                            if curr_end.tzinfo is None:
-                                curr_end = curr_end.replace(tzinfo=timezone.utc)
-
-                        base_time = max(now, curr_end) if curr_end else now
+                        base_time = max(now, ref_trial_end) if ref_trial_end else now
                         new_end = base_time + timedelta(days=14)
-                        await db.execute("UPDATE users SET trial_end = ?, status = 'trial' WHERE user_id = ?", (new_end.isoformat(), referrer_id))
-
-                    await db.commit()
+                        await db.execute("UPDATE users SET trial_end = $1, status = 'trial' WHERE user_id = $2", new_end, referrer_id)
 
                     safe_username = escape_md(username)
                     bonus_msg = (
@@ -824,10 +830,9 @@ async def forward_token_to_admin(user_id: int, username: str, token: str):
 
     user_disp = f"@{escape_md(username)}" if username and username != "no_username" else f"ID: {user_id}"
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT selected_coin FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            selected_coin = row[0] if row and row[0] else "не обрано"
+    async with db_pool.acquire() as db:
+        row = await db.fetchrow("SELECT selected_coin FROM users WHERE user_id = $1", user_id)
+        selected_coin = row["selected_coin"] if row and row["selected_coin"] else "не обрано"
 
     admin_text = (
         "🔑 **НОВИЙ SIGNAL TOKEN ВІД КОРИСТУВАЧА**\n\n"
@@ -881,9 +886,8 @@ async def telegram_webhook(request: Request):
                     return {"status": "ok"}
                 # =======================================================
 
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute("UPDATE users SET signal_token = ? WHERE user_id = ?", (raw_token, user_id))
-                    await db.commit()
+                async with db_pool.acquire() as db:
+                    await db.execute("UPDATE users SET signal_token = $1 WHERE user_id = $2", raw_token, user_id)
 
                 # Пересилаємо токен адміну для ручного додавання у TradingView
                 await forward_token_to_admin(user_id, username, raw_token)
@@ -902,14 +906,13 @@ async def telegram_webhook(request: Request):
                         try:
                             ref_id = int(args[1].split("_")[1])
                             if ref_id != user_id:
-                                async with aiosqlite.connect(DB_PATH) as db:
+                                async with db_pool.acquire() as db:
                                     await db.execute("""
                                         INSERT INTO users (user_id, username, referrer_id, lang)
-                                        VALUES (?, ?, ?, ?)
-                                        ON CONFLICT(user_id) DO UPDATE SET
+                                        VALUES ($1, $2, $3, $4)
+                                        ON CONFLICT (user_id) DO UPDATE SET
                                             referrer_id = COALESCE(users.referrer_id, excluded.referrer_id)
-                                    """, (user_id, username, ref_id, user_lang))
-                                    await db.commit()
+                                    """, user_id, username, ref_id, user_lang)
                         except ValueError:
                             pass
 
@@ -942,7 +945,7 @@ async def telegram_webhook(request: Request):
                         now = datetime.now(timezone.utc)
                         new_end = now + timedelta(days=30)
 
-                        async with aiosqlite.connect(DB_PATH) as db:
+                        async with db_pool.acquire() as db:
                             # =======================================================
                             # ФІКС БАГ #1: INSERT ... ON CONFLICT замість голого UPDATE,
                             # інакше видача доступу користувачу, якого ще немає в БД,
@@ -950,16 +953,14 @@ async def telegram_webhook(request: Request):
                             # =======================================================
                             await db.execute("""
                                 INSERT INTO users (user_id, status, sub_end)
-                                VALUES (?, 'VIP', ?)
-                                ON CONFLICT(user_id) DO UPDATE SET
+                                VALUES ($1, 'VIP', $2)
+                                ON CONFLICT (user_id) DO UPDATE SET
                                     status = excluded.status,
                                     sub_end = excluded.sub_end
-                            """, (target_user_id, new_end.isoformat()))
-                            await db.commit()
+                            """, target_user_id, new_end)
 
-                            async with db.execute("SELECT lang FROM users WHERE user_id = ?", (target_user_id,)) as cursor:
-                                row = await cursor.fetchone()
-                                target_lang = row[0] if row and row[0] else "ua"
+                            row = await db.fetchrow("SELECT lang FROM users WHERE user_id = $1", target_user_id)
+                            target_lang = row["lang"] if row and row["lang"] else "ua"
 
                         user_msg = (
                             f"🎉 **Адміністратор надав вам VIP доступ на 30 днів!**"
@@ -989,23 +990,21 @@ async def telegram_webhook(request: Request):
                         now = datetime.now(timezone.utc)
                         new_end = now + timedelta(days=30)
 
-                        async with aiosqlite.connect(DB_PATH) as db:
+                        async with db_pool.acquire() as db:
                             # =======================================================
                             # ФІКС БАГ #1: те саме для /give_bot
                             # =======================================================
                             await db.execute("""
                                 INSERT INTO users (user_id, status, bot_sub_end)
-                                VALUES (?, 'BOT', ?)
-                                ON CONFLICT(user_id) DO UPDATE SET
+                                VALUES ($1, 'BOT', $2)
+                                ON CONFLICT (user_id) DO UPDATE SET
                                     status = excluded.status,
                                     bot_sub_end = excluded.bot_sub_end
-                            """, (target_user_id, new_end.isoformat()))
-                            await db.commit()
+                            """, target_user_id, new_end)
 
-                            async with db.execute("SELECT lang, signal_token FROM users WHERE user_id = ?", (target_user_id,)) as cursor:
-                                row = await cursor.fetchone()
-                                target_lang = row[0] if row and row[0] else "ua"
-                                user_token = row[1] if row else None
+                            row = await db.fetchrow("SELECT lang, signal_token FROM users WHERE user_id = $1", target_user_id)
+                            target_lang = row["lang"] if row and row["lang"] else "ua"
+                            user_token = row["signal_token"] if row else None
 
                         try:
                             if user_token:
@@ -1237,14 +1236,19 @@ async def telegram_webhook(request: Request):
                 await query.edit_message_text(text=res_text, reply_markup=get_back_keyboard(user_lang), parse_mode="Markdown")
 
             elif data == "btn_my_sub":
-                async with aiosqlite.connect(DB_PATH) as db:
-                    async with db.execute("SELECT status, trial_end, sub_end, bot_sub_end, signal_token, selected_coin FROM users WHERE user_id = ?", (user_id,)) as cursor:
-                        row = await cursor.fetchone()
+                async with db_pool.acquire() as db:
+                    row = await db.fetchrow(
+                        "SELECT status, trial_end, sub_end, bot_sub_end, signal_token, selected_coin FROM users WHERE user_id = $1",
+                        user_id
+                    )
 
                 if not row:
                     sub_info = "У вас немає активних підписок." if user_lang == "ua" else "You have no active subscriptions."
                 else:
-                    status, t_end, s_end, b_end, token, selected_coin = row
+                    status, t_end, s_end, b_end, token, selected_coin = (
+                        row["status"], row["trial_end"], row["sub_end"], row["bot_sub_end"],
+                        row["signal_token"], row["selected_coin"]
+                    )
                     status_label = status.upper() if status else "FREE"
                     sub_info = (
                         f"📊 **Статус:** `{status_label}`\n\n"
@@ -1254,24 +1258,27 @@ async def telegram_webhook(request: Request):
 
                     if t_end:
                         days_left = calc_days_left(t_end)
+                        t_end_disp = t_end.strftime('%Y-%m-%d %H:%M')
                         if user_lang == "ua":
-                            sub_info += f"🎁 **Триал:** залишилось {days_left} дн. (до {t_end[:16].replace('T', ' ')} UTC)\n"
+                            sub_info += f"🎁 **Триал:** залишилось {days_left} дн. (до {t_end_disp} UTC)\n"
                         else:
-                            sub_info += f"🎁 **Trial:** {days_left} days left (until {t_end[:16].replace('T', ' ')} UTC)\n"
+                            sub_info += f"🎁 **Trial:** {days_left} days left (until {t_end_disp} UTC)\n"
 
                     if s_end:
                         days_left = calc_days_left(s_end)
+                        s_end_disp = s_end.strftime('%Y-%m-%d %H:%M')
                         if user_lang == "ua":
-                            sub_info += f"💎 **VIP-група:** залишилось {days_left} дн. (до {s_end[:16].replace('T', ' ')} UTC)\n"
+                            sub_info += f"💎 **VIP-група:** залишилось {days_left} дн. (до {s_end_disp} UTC)\n"
                         else:
-                            sub_info += f"💎 **VIP Group:** {days_left} days left (until {s_end[:16].replace('T', ' ')} UTC)\n"
+                            sub_info += f"💎 **VIP Group:** {days_left} days left (until {s_end_disp} UTC)\n"
 
                     if b_end:
                         days_left = calc_days_left(b_end)
+                        b_end_disp = b_end.strftime('%Y-%m-%d %H:%M')
                         if user_lang == "ua":
-                            sub_info += f"🤖 **Signal Bot:** залишилось {days_left} дн. (до {b_end[:16].replace('T', ' ')} UTC)\n"
+                            sub_info += f"🤖 **Signal Bot:** залишилось {days_left} дн. (до {b_end_disp} UTC)\n"
                         else:
-                            sub_info += f"🤖 **Signal Bot:** {days_left} days left (until {b_end[:16].replace('T', ' ')} UTC)\n"
+                            sub_info += f"🤖 **Signal Bot:** {days_left} days left (until {b_end_disp} UTC)\n"
 
                     if selected_coin:
                         coin_label = "🪙 **Монета:**" if user_lang == "ua" else "🪙 **Coin:**"
@@ -1304,14 +1311,13 @@ async def telegram_webhook(request: Request):
                     return {"status": "ok"}
 
                 if data == "admin_users_list":
-                    async with aiosqlite.connect(DB_PATH) as db:
-                        async with db.execute("""
+                    async with db_pool.acquire() as db:
+                        users = await db.fetch("""
                             SELECT user_id, username, status, trial_end, sub_end, bot_sub_end
                             FROM users
                             ORDER BY user_id DESC
                             LIMIT 30
-                        """) as cursor:
-                            users = await cursor.fetchall()
+                        """)
 
                     if not users:
                         text = "📊 База користувачів порожня."
@@ -1323,32 +1329,17 @@ async def telegram_webhook(request: Request):
                             u_name_disp = f"@{escape_md(u_name)}" if u_name and u_name != "no_username" else f"ID: `{u_id}`"
                             services = []
 
-                            if t_end:
-                                try:
-                                    t_dt = datetime.fromisoformat(t_end)
-                                    if t_dt.tzinfo is None: t_dt = t_dt.replace(tzinfo=timezone.utc)
-                                    if t_dt > now_utc:
-                                        days_left = calc_days_left(t_end)
-                                        services.append(f"⏳ Тріал: {days_left} дн. (до {t_dt.strftime('%d.%m')})")
-                                except Exception: pass
+                            if t_end and t_end > now_utc:
+                                days_left = calc_days_left(t_end)
+                                services.append(f"⏳ Тріал: {days_left} дн. (до {t_end.strftime('%d.%m')})")
 
-                            if s_end:
-                                try:
-                                    s_dt = datetime.fromisoformat(s_end)
-                                    if s_dt.tzinfo is None: s_dt = s_dt.replace(tzinfo=timezone.utc)
-                                    if s_dt > now_utc:
-                                        days_left = calc_days_left(s_end)
-                                        services.append(f"💎 VIP: {days_left} дн. (до {s_dt.strftime('%d.%m')})")
-                                except Exception: pass
+                            if s_end and s_end > now_utc:
+                                days_left = calc_days_left(s_end)
+                                services.append(f"💎 VIP: {days_left} дн. (до {s_end.strftime('%d.%m')})")
 
-                            if b_end:
-                                try:
-                                    b_dt = datetime.fromisoformat(b_end)
-                                    if b_dt.tzinfo is None: b_dt = b_dt.replace(tzinfo=timezone.utc)
-                                    if b_dt > now_utc:
-                                        days_left = calc_days_left(b_end)
-                                        services.append(f"🤖 Bot: {days_left} дн. (до {b_dt.strftime('%d.%m')})")
-                                except Exception: pass
+                            if b_end and b_end > now_utc:
+                                days_left = calc_days_left(b_end)
+                                services.append(f"🤖 Bot: {days_left} дн. (до {b_end.strftime('%d.%m')})")
 
                             services_str = " | ".join(services) if services else "немає активних послуг"
                             status_disp = u_status.upper() if u_status else "FREE"
@@ -1392,10 +1383,9 @@ async def telegram_webhook(request: Request):
                 now = datetime.now(timezone.utc)
                 new_end = now + timedelta(days=30)
 
-                async with aiosqlite.connect(DB_PATH) as db:
+                async with db_pool.acquire() as db:
                     if action_type == "approve_vip":
-                        await db.execute("UPDATE users SET status = 'active', sub_end = ? WHERE user_id = ?", (new_end.isoformat(), target_user_id))
-                        await db.commit()
+                        await db.execute("UPDATE users SET status = 'active', sub_end = $1 WHERE user_id = $2", new_end, target_user_id)
 
                         invite_link = await bot.create_chat_invite_link(chat_id=TELEGRAM_CHANNEL_ID, member_limit=1) if TELEGRAM_CHANNEL_ID else None
                         link_str = invite_link.invite_link if invite_link else "Перевірте канал."
@@ -1405,8 +1395,7 @@ async def telegram_webhook(request: Request):
                         await query.edit_message_text(text=f"✅ VIP підтверджено для ID: `{target_user_id}`")
 
                     elif action_type == "approve_bot":
-                        await db.execute("UPDATE users SET bot_sub_end = ? WHERE user_id = ?", (new_end.isoformat(), target_user_id))
-                        await db.commit()
+                        await db.execute("UPDATE users SET bot_sub_end = $1 WHERE user_id = $2", new_end, target_user_id)
 
                         approve_intro = (
                             "🎉 **Оплату Kerdos Signal Bot підтверджено!**"
@@ -1507,12 +1496,11 @@ async def tradingview_webhook(request: Request):
             price_block = f"💵 **Entry Price:** {price}"
 
         # 1. Запис в історію
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with db_pool.acquire() as db:
             await db.execute(
-                "INSERT INTO trades (ticker, action, price, timestamp) VALUES (?, ?, ?, ?)",
-                (ticker, db_action, price, now.isoformat())
+                "INSERT INTO trades (ticker, action, price, timestamp) VALUES ($1, $2, $3, $4)",
+                ticker, db_action, price, now
             )
-            await db.commit()
 
         # 2. Сповіщення в Telegram
         if TELEGRAM_CHANNEL_ID and bot:
